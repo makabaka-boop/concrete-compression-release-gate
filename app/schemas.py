@@ -24,6 +24,12 @@ class EvaluationRequest(BaseModel):
         max_length=3,
         description="恰好三个试件",
     )
+    calibration_factor: Decimal = Field(
+        default=Decimal("1"),
+        ge=Decimal("0.9500"),
+        le=Decimal("1.0500"),
+        description="压力机校准载荷修正系数，可选；省略时按 1 处理，范围 0.9500 至 1.0500，显式 null 视为非法",
+    )
 
 
 class EvaluationResponse(BaseModel):
@@ -34,4 +40,8 @@ class EvaluationResponse(BaseModel):
     passed: bool = Field(description="批次是否放行")
     reasons: list[ReasonCode] = Field(
         description="未通过原因，固定顺序 MEAN_BELOW_DESIGN、MIN_BELOW_85_PERCENT；通过时为空"
+    )
+    applied_calibration_factor: float | None = Field(
+        default=None,
+        description="实际应用的校准系数；仅当请求显式携带 calibration_factor 时返回，省略时不出现该字段",
     )

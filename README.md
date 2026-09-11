@@ -28,7 +28,7 @@ API_BASE_URL=http://localhost:8000 pytest tests/ -v
 
 ### `POST /evaluate`
 
-请求体（JSON，所有数值必须大于零）：
+请求体（JSON，`design_strength_mpa` 与试件数值必须大于零）：
 
 | 字段 | 类型 | 单位 | 说明 |
 | --- | --- | --- | --- |
@@ -36,6 +36,7 @@ API_BASE_URL=http://localhost:8000 pytest tests/ -v
 | `specimens` | array（恰好 3 项） | — | 试件列表 |
 | `specimens[].area_mm2` | number | mm² | 受压面积 |
 | `specimens[].load_kn` | number | kN | 破坏载荷 |
+| `calibration_factor` | number，可选 | — | 压力机校准载荷修正系数，范围 0.9500–1.0500（含边界）；省略时按 1 处理，显式 `null` 视为非法 |
 
 示例：
 
@@ -71,6 +72,35 @@ curl -X POST http://localhost:8000/evaluate \
 | `mean_strength_mpa` | 三项强度的算术平均值（MPa，0.1 精度） |
 | `passed` | 批次是否放行 |
 | `reasons` | 未通过原因；通过时为空数组 |
+| `applied_calibration_factor` | 实际应用的校准系数；**仅当请求显式携带 `calibration_factor` 时返回**，省略时响应保持原有四个字段 |
+
+携带校准系数的示例（临界批次按校准后载荷裁决）：
+
+```bash
+curl -X POST http://localhost:8000/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "design_strength_mpa": 30.0,
+        "calibration_factor": 1.01,
+        "specimens": [
+          {"area_mm2": 22500, "load_kn": 660},
+          {"area_mm2": 22500, "load_kn": 670},
+          {"area_mm2": 22500, "load_kn": 680}
+        ]
+      }'
+```
+
+响应 `200 OK`（未校准时平均强度 29.8 MPa 低于设计值，校准后转为放行）：
+
+```json
+{
+  "strengths_mpa": [29.6, 30.1, 30.5],
+  "mean_strength_mpa": 30.1,
+  "passed": true,
+  "reasons": [],
+  "applied_calibration_factor": 1.01
+}
+```
 
 ### `GET /health`
 
@@ -78,26 +108,27 @@ curl -X POST http://localhost:8000/evaluate \
 
 ## 计算规则
 
-1. 单块强度 = `load_kn × 1000 ÷ area_mm2`（kN 换算为 N 后除以 mm² 得 MPa），按 **ROUND_HALF_UP** 保留 **0.1 MPa**。
-2. 平均强度 = 三个**舍入后**单块强度的算术平均值，再按 ROUND_HALF_UP 保留 0.1 MPa。
-3. 放行需同时满足（等于阈值计入通过）：
+1. 若请求显式携带 `calibration_factor`，先将每块试件的 `load_kn` 以 `Decimal` 乘以该系数得到校准载荷；校准载荷**不做任何中间舍入**。省略系数时按 1 处理，计算结果与未扩展前的契约完全一致。
+2. 单块强度 = `load_kn × 1000 ÷ area_mm2`（kN 换算为 N 后除以 mm² 得 MPa；携带系数时使用校准后的载荷），按 **ROUND_HALF_UP** 保留 **0.1 MPa**。
+3. 平均强度 = 三个**舍入后**单块强度的算术平均值，再按 ROUND_HALF_UP 保留 0.1 MPa。
+4. 放行需同时满足（等于阈值计入通过）：
    - 平均强度 ≥ 设计强度；
    - 最低单块强度 ≥ 设计强度的 **85.0%**。
-4. 未通过时 `reasons` 包含全部未满足条件，固定顺序：
+5. 未通过时 `reasons` 包含全部未满足条件，固定顺序：
    - `MEAN_BELOW_DESIGN` — 平均强度低于设计强度；
    - `MIN_BELOW_85_PERCENT` — 最低单值低于设计强度的 85.0%。
    两者同时不满足时返回两项，通过时为空数组。
 
 ## 错误处理
 
-字段缺失、试件数量不为 3、数值非正数或无法解析为数值时，统一返回 `422 Unprocessable Entity`，响应中不包含任何部分强度结果。
+字段缺失、试件数量不为 3、数值非正数或无法解析为数值时，统一返回 `422 Unprocessable Entity`，响应中不包含任何部分强度结果。`calibration_factor` 越出 0.9500–1.0500、非数值或显式 `null` 时同样返回 422，错误位置（`detail[].loc`）指向 `calibration_factor`。
 
 ## 项目结构
 
 ```
 app/
   main.py      # FastAPI 入口，POST /evaluate 与 GET /health
-  schemas.py   # Pydantic 请求/响应契约（正数校验、恰好三个试件）
+  schemas.py   # Pydantic 请求/响应契约（正数校验、恰好三个试件、可选校准系数）
   service.py   # Decimal 强度计算与批次放行裁决
 tests/
   test_api.py  # 通过真实 HTTP 验证链路的 pytest 用例

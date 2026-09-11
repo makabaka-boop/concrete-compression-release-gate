@@ -137,6 +137,116 @@ def test_design_strength_scales_the_85_percent_threshold():
     assert body["reasons"] == ["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
 
 
+def test_calibration_factor_turns_borderline_batch_into_pass():
+    # Uncalibrated: 29.3 / 29.8 / 30.2 MPa, mean 29.8 < 30.0 -> fail.
+    # Factor 1.01 scales every load first: 29.6 / 30.1 / 30.5, mean 30.1.
+    payload = make_payload(30.0, [660, 670, 680])
+    payload["calibration_factor"] = 1.01
+    response = evaluate(payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [29.6, 30.1, 30.5]
+    assert body["mean_strength_mpa"] == 30.1
+    assert body["passed"] is True
+    assert body["reasons"] == []
+    assert body["applied_calibration_factor"] == 1.01
+
+
+def test_calibration_lower_boundary_factor_is_accepted():
+    # Factor 0.9500 (lower bound): 29.6 / 30.4 / 30.0 MPa, mean exactly
+    # 30.0 -> threshold equality still passes.
+    payload = make_payload(30.0, [700, 720, 710])
+    payload["calibration_factor"] = 0.95
+    response = evaluate(payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [29.6, 30.4, 30.0]
+    assert body["mean_strength_mpa"] == 30.0
+    assert body["passed"] is True
+    assert body["reasons"] == []
+    assert body["applied_calibration_factor"] == 0.95
+
+
+def test_calibration_upper_boundary_factor_is_accepted():
+    # Factor 1.0500 (upper bound): 30.8 / 31.3 / 31.7 MPa, mean 31.3.
+    payload = make_payload(30.0, [660, 670, 680])
+    payload["calibration_factor"] = 1.05
+    response = evaluate(payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [30.8, 31.3, 31.7]
+    assert body["mean_strength_mpa"] == 31.3
+    assert body["passed"] is True
+    assert body["reasons"] == []
+    assert body["applied_calibration_factor"] == 1.05
+
+
+def test_calibrated_load_is_not_rounded_before_strength():
+    # 700.62 kN * 1.01 = 707.6262 kN -> 31.45005... MPa -> 31.5 MPa.
+    # Rounding the calibrated load to 0.1 kN (707.6) would give 31.4 MPa.
+    payload = make_payload(30.0, [700.62, 720, 720])
+    payload["calibration_factor"] = 1.01
+    response = evaluate(payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [31.5, 32.3, 32.3]
+    assert body["mean_strength_mpa"] == 32.0
+    assert body["passed"] is True
+    assert body["applied_calibration_factor"] == 1.01
+
+
+def test_explicit_neutral_factor_still_echoes_applied_factor():
+    # Factor 1.0 changes nothing numerically but was explicitly provided,
+    # so the response must carry applied_calibration_factor.
+    payload = make_payload(30.0, [700, 720, 710])
+    payload["calibration_factor"] = 1.0
+    response = evaluate(payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [31.1, 32.0, 31.6]
+    assert body["mean_strength_mpa"] == 31.6
+    assert body["passed"] is True
+    assert body["applied_calibration_factor"] == 1.0
+
+
+def test_legacy_request_without_calibration_is_fully_compatible():
+    # Same payload as before the contract extension: identical values and
+    # exactly the original four response fields, no calibration trace.
+    response = evaluate(make_payload(30.0, [700, 720, 710]))
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"strengths_mpa", "mean_strength_mpa", "passed", "reasons"}
+    assert body["strengths_mpa"] == [31.1, 32.0, 31.6]
+    assert body["mean_strength_mpa"] == 31.6
+    assert body["passed"] is True
+    assert body["reasons"] == []
+
+
+INVALID_CALIBRATION_FACTORS = {
+    "factor_below_range": 0.9499,
+    "factor_above_range": 1.0501,
+    "factor_non_numeric": "abc",
+    "factor_explicit_null": None,
+}
+
+
+@pytest.mark.parametrize(
+    "factor", INVALID_CALIBRATION_FACTORS.values(), ids=INVALID_CALIBRATION_FACTORS.keys()
+)
+def test_invalid_calibration_factor_returns_422_without_partial_results(factor):
+    payload = make_payload(30.0, [700, 720, 710])
+    payload["calibration_factor"] = factor
+    response = evaluate(payload)
+    assert response.status_code == 422
+    body = response.json()
+    assert "strengths_mpa" not in body
+    assert "mean_strength_mpa" not in body
+    assert "passed" not in body
+    assert "applied_calibration_factor" not in body
+    locations = [error["loc"] for error in body["detail"]]
+    assert any(loc[-1] == "calibration_factor" for loc in locations)
+
+
 INVALID_PAYLOADS = {
     "missing_design_strength": {
         "specimens": [{"area_mm2": 22500, "load_kn": 700}] * 3,

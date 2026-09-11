@@ -3,6 +3,9 @@
 All arithmetic uses Decimal. Strengths and the mean are quantized to
 0.1 MPa with ROUND_HALF_UP; comparisons against the design strength and
 the 85.0% minimum-single-value threshold are inclusive (equality passes).
+
+An optional press calibration factor scales each specimen's load before
+the strength rounding; the calibrated load itself is never rounded.
 """
 
 from decimal import ROUND_HALF_UP, Decimal
@@ -10,6 +13,7 @@ from typing import NamedTuple, Sequence
 
 MPA_RESOLUTION = Decimal("0.1")
 MIN_SINGLE_RATIO = Decimal("0.85")
+NO_CALIBRATION = Decimal("1")
 
 REASON_MEAN_BELOW_DESIGN = "MEAN_BELOW_DESIGN"
 REASON_MIN_BELOW_85_PERCENT = "MIN_BELOW_85_PERCENT"
@@ -38,9 +42,15 @@ def specimen_strength_mpa(load_kn: Decimal, area_mm2: Decimal) -> Decimal:
 
 
 def evaluate_batch(
-    design_strength_mpa: Decimal, specimens: Sequence[SpecimenInput]
+    design_strength_mpa: Decimal,
+    specimens: Sequence[SpecimenInput],
+    calibration_factor: Decimal = NO_CALIBRATION,
 ) -> EvaluationResult:
     """Evaluate one batch of specimens against the release criteria.
+
+    Each specimen's load_kn is first multiplied by calibration_factor
+    (Decimal multiplication, no intermediate rounding of the calibrated
+    load); the result then flows through the usual strength rounding.
 
     Pass requires both:
       * mean of the three rounded strengths >= design strength
@@ -49,7 +59,8 @@ def evaluate_batch(
     MIN_BELOW_85_PERCENT.
     """
     strengths = tuple(
-        specimen_strength_mpa(s.load_kn, s.area_mm2) for s in specimens
+        specimen_strength_mpa(s.load_kn * calibration_factor, s.area_mm2)
+        for s in specimens
     )
     mean = round_to_tenth(sum(strengths) / Decimal(len(strengths)))
 
