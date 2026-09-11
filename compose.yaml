@@ -4,6 +4,11 @@ services:
     image: concrete-strength-api
     ports:
       - "${API_PORT:-8000}:8000"
+    environment:
+      # 台账 SQLite 文件位置；挂载命名卷使记录跨容器重建保留
+      EVALUATION_DB_PATH: /srv/app/data/evaluations.db
+    volumes:
+      - ledger:/srv/app/data
     healthcheck:
       test:
         - CMD
@@ -24,3 +29,6 @@ services:
     depends_on:
       api:
         condition: service_healthy
+
+volumes:
+  ledger:

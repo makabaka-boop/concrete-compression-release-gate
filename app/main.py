@@ -9,8 +9,9 @@ from fastapi import FastAPI, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY
+from starlette.status import HTTP_409_CONFLICT, HTTP_422_UNPROCESSABLE_ENTITY
 
+from . import store
 from .schemas import EvaluationRequest, EvaluationResponse
 from .service import SpecimenInput, evaluate_batch
 
@@ -108,6 +109,45 @@ def evaluate(request: EvaluationRequest) -> Response:
     )
     # Render directly so Decimal fields keep their exact value as JSON
     # numbers; the stock pipeline would stringify or truncate them.
-    return ExactDecimalJSONResponse(
-        response.model_dump(mode="python", exclude_none=True)
+    body = response.model_dump(mode="python", exclude_none=True)
+
+    if request.evaluation_id is None:
+        # No idempotency key: compute and respond as before, persist nothing.
+        return ExactDecimalJSONResponse(body)
+
+    fingerprint = store.build_fingerprint(
+        request.design_strength_mpa,
+        [(s.area_mm2, s.load_kn) for s in request.specimens],
+        request.calibration_factor,
+        "calibration_factor" in request.model_fields_set,
     )
+    record = store.lookup(request.evaluation_id)
+    replayed = record is not None
+    if record is None:
+        # First sight of this id: persist the verdict. A racing request may
+        # win the insert; the stored record always stands.
+        record, inserted = store.store_if_absent(
+            request.evaluation_id, fingerprint, _dumps_exact(body)
+        )
+        replayed = not inserted
+
+    if record.fingerprint != fingerprint:
+        # Same id but different business input: reject without touching the
+        # stored record.
+        return JSONResponse(
+            status_code=HTTP_409_CONFLICT,
+            content={
+                "detail": (
+                    "evaluation_id 冲突：该标识已对应不同的业务输入，"
+                    "已保存的首次结果未被覆盖"
+                ),
+                "evaluation_id": request.evaluation_id,
+            },
+        )
+
+    # Replay the stored body verbatim. parse_float=Decimal keeps every
+    # significant digit through the round trip (a float parse would
+    # truncate extreme values such as 1e30-scale strengths).
+    stored_body = json.loads(record.response_json, parse_float=Decimal)
+    stored_body["replayed"] = replayed
+    return ExactDecimalJSONResponse(stored_body)

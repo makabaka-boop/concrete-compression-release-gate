@@ -21,3 +21,6 @@ dist/
 
 # Local environment overrides
 .env
+
+# Idempotency ledger (default EVALUATION_DB_PATH location)
+data/

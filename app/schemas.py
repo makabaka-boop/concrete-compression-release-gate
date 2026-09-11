@@ -1,5 +1,6 @@
 """Request/response contracts for the batch strength evaluation API."""
 
+import re
 from decimal import Decimal
 from typing import Annotated, Literal
 
@@ -12,6 +13,14 @@ ReasonCode = Literal["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
 # even though pydantic's default serialization schema for Decimal is
 # "string".
 JsonNumber = Annotated[Decimal, WithJsonSchema({"type": "number"}, mode="serialization")]
+
+# evaluation_id is an opaque client-supplied idempotency key. It must be
+# non-blank when present (an empty id would silently share one ledger slot
+# across unrelated requests) and is length-capped so the ledger stays sane.
+EvaluationId = Annotated[
+    str,
+    Field(min_length=1, max_length=128, pattern=re.compile(r"\S")),
+]
 
 
 class Specimen(BaseModel):
@@ -36,6 +45,10 @@ class EvaluationRequest(BaseModel):
         le=Decimal("1.0500"),
         description="压力机校准载荷修正系数，可选；省略时按 1 处理，范围 0.9500 至 1.0500，显式 null 视为非法",
     )
+    evaluation_id: EvaluationId | None = Field(
+        default=None,
+        description="幂等标识，可选；携带时相同标识与相同业务输入的重试直接回放首次结果，标识冲突返回 409，显式 null 视为未携带",
+    )
 
 
 class EvaluationResponse(BaseModel):
@@ -55,4 +68,8 @@ class EvaluationResponse(BaseModel):
     applied_calibration_factor: JsonNumber | None = Field(
         default=None,
         description="实际应用的校准系数；仅当请求显式携带 calibration_factor 时返回，省略时不出现该字段",
+    )
+    replayed: bool | None = Field(
+        default=None,
+        description="是否回放了已保存的首次结果；仅当请求携带 evaluation_id 时返回，省略时不出现该字段",
     )
