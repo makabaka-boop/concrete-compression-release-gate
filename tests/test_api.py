@@ -1,0 +1,199 @@
+"""End-to-end tests against the live HTTP API.
+
+Run with the API reachable at API_BASE_URL (default http://localhost:8000).
+All calculations are verified through the real HTTP chain, never by
+stubbing the application.
+"""
+
+import os
+import time
+
+import httpx
+import pytest
+
+BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
+AREA_MM2 = 22500  # 150 mm cube face
+
+
+@pytest.fixture(scope="session", autouse=True)
+def wait_for_api() -> None:
+    deadline = time.time() + 60
+    while True:
+        try:
+            response = httpx.get(f"{BASE_URL}/health", timeout=2)
+            if response.status_code == 200:
+                return
+        except httpx.HTTPError:
+            pass
+        if time.time() > deadline:
+            pytest.fail(f"API at {BASE_URL} did not become healthy within 60s")
+        time.sleep(1)
+
+
+def make_payload(design_strength, loads, area=AREA_MM2):
+    return {
+        "design_strength_mpa": design_strength,
+        "specimens": [{"area_mm2": area, "load_kn": load} for load in loads],
+    }
+
+
+def evaluate(payload):
+    return httpx.post(f"{BASE_URL}/evaluate", json=payload, timeout=10)
+
+
+def test_health_endpoint():
+    response = httpx.get(f"{BASE_URL}/health", timeout=5)
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_pass_when_mean_and_minimum_meet_design():
+    # 700/720/710 kN on 22500 mm² -> 31.1 / 32.0 / 31.6 MPa, mean 31.6 MPa
+    response = evaluate(make_payload(30.0, [700, 720, 710]))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [31.1, 32.0, 31.6]
+    assert body["mean_strength_mpa"] == 31.6
+    assert body["passed"] is True
+    assert body["reasons"] == []
+
+
+def test_average_passes_but_low_outlier_fails_batch():
+    # Headline scenario: mean 31.1 MPa >= 30.0 hides a 22.2 MPa outlier
+    # below 85.0% of design (25.5 MPa).
+    response = evaluate(make_payload(30.0, [800, 800, 500]))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [35.6, 35.6, 22.2]
+    assert body["mean_strength_mpa"] == 31.1
+    assert body["passed"] is False
+    assert body["reasons"] == ["MIN_BELOW_85_PERCENT"]
+
+
+def test_mean_below_design_only():
+    # 29.3 / 29.8 / 30.2 MPa, mean 29.8 < 30.0; minimum 29.3 >= 25.5
+    response = evaluate(make_payload(30.0, [660, 670, 680]))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [29.3, 29.8, 30.2]
+    assert body["mean_strength_mpa"] == 29.8
+    assert body["passed"] is False
+    assert body["reasons"] == ["MEAN_BELOW_DESIGN"]
+
+
+def test_both_conditions_fail_in_fixed_order():
+    # mean 23.7 < 30.0 and minimum 17.8 < 25.5
+    response = evaluate(make_payload(30.0, [600, 600, 400]))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [26.7, 26.7, 17.8]
+    assert body["mean_strength_mpa"] == 23.7
+    assert body["passed"] is False
+    assert body["reasons"] == ["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
+
+
+def test_threshold_equality_counts_as_pass():
+    # Strengths exactly 25.5 / 32.0 / 32.5 MPa: mean exactly 30.0 MPa and
+    # minimum exactly 85.0% of design (25.5 MPa) must both pass.
+    response = evaluate(make_payload(30.0, [573.75, 720, 731.25]))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [25.5, 32.0, 32.5]
+    assert body["mean_strength_mpa"] == 30.0
+    assert body["passed"] is True
+    assert body["reasons"] == []
+
+
+def test_strength_rounding_is_half_up_not_bankers():
+    # 707.625 kN / 22500 mm² = 31.45 MPa exactly; ROUND_HALF_UP -> 31.5
+    # (ROUND_HALF_EVEN would give 31.4).
+    response = evaluate(make_payload(30.0, [707.625, 720, 720]))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [31.5, 32.0, 32.0]
+    assert body["mean_strength_mpa"] == 31.8
+    assert body["passed"] is True
+
+
+def test_mean_is_computed_from_rounded_strengths_then_rounded():
+    # 31.1 / 31.2 / 31.2 MPa -> sum 93.5 -> mean 31.1666... -> 31.2 MPa
+    response = evaluate(make_payload(30.0, [699.75, 702, 702]))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [31.1, 31.2, 31.2]
+    assert body["mean_strength_mpa"] == 31.2
+    assert body["passed"] is True
+
+
+def test_design_strength_scales_the_85_percent_threshold():
+    # Design 40.0 MPa -> 85% threshold 34.0 MPa; minimum 33.8 fails it
+    # while mean 34.1 >= 40.0 is false too, so both reasons appear.
+    response = evaluate(make_payload(40.0, [900, 900, 760]))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [40.0, 40.0, 33.8]
+    assert body["mean_strength_mpa"] == 37.9
+    assert body["passed"] is False
+    assert body["reasons"] == ["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
+
+
+INVALID_PAYLOADS = {
+    "missing_design_strength": {
+        "specimens": [{"area_mm2": 22500, "load_kn": 700}] * 3,
+    },
+    "missing_specimens": {"design_strength_mpa": 30.0},
+    "specimen_missing_load": {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"area_mm2": 22500, "load_kn": 700},
+            {"area_mm2": 22500},
+            {"area_mm2": 22500, "load_kn": 710},
+        ],
+    },
+    "two_specimens": {
+        "design_strength_mpa": 30.0,
+        "specimens": [{"area_mm2": 22500, "load_kn": 700}] * 2,
+    },
+    "four_specimens": {
+        "design_strength_mpa": 30.0,
+        "specimens": [{"area_mm2": 22500, "load_kn": 700}] * 4,
+    },
+    "zero_load": {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"area_mm2": 22500, "load_kn": 0},
+            {"area_mm2": 22500, "load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 710},
+        ],
+    },
+    "negative_area": {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"area_mm2": -22500, "load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 710},
+        ],
+    },
+    "zero_design_strength": {
+        "design_strength_mpa": 0,
+        "specimens": [{"area_mm2": 22500, "load_kn": 700}] * 3,
+    },
+    "non_numeric_area": {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"area_mm2": "abc", "load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 710},
+        ],
+    },
+}
+
+
+@pytest.mark.parametrize("payload", INVALID_PAYLOADS.values(), ids=INVALID_PAYLOADS.keys())
+def test_invalid_payloads_return_422_without_partial_strengths(payload):
+    response = evaluate(payload)
+    assert response.status_code == 422
+    body = response.json()
+    assert "strengths_mpa" not in body
+    assert "mean_strength_mpa" not in body
+    assert "passed" not in body
