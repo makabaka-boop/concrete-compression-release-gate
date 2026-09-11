@@ -5,8 +5,10 @@ All calculations are verified through the real HTTP chain, never by
 stubbing the application.
 """
 
+import json
 import os
 import time
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -222,6 +224,82 @@ def test_legacy_request_without_calibration_is_fully_compatible():
     assert body["reasons"] == []
 
 
+def test_extremely_large_loads_return_complete_verdict():
+    # 1e30 kN is legal (positive) but each strength 1e30*1000/22500 MPa has
+    # 30 significant digits — beyond the default 28-digit decimal context;
+    # the verdict must still be computed exactly instead of failing with an
+    # internal error.
+    response = evaluate(make_payload(30.0, [1e30, 1e30, 1e30]))
+    assert response.status_code == 200
+    body = json.loads(response.text, parse_float=Decimal)
+    expected = Decimal("44444444444444444444444444444.4")
+    assert body["strengths_mpa"] == [expected, expected, expected]
+    assert body["mean_strength_mpa"] == expected
+    assert body["passed"] is True
+    assert body["reasons"] == []
+
+
+def test_extremely_small_areas_return_complete_verdict():
+    # 1e-25 mm² is legal (positive) but each strength tops 1e30 MPa — beyond
+    # the default 28-digit decimal context; the verdict must still be
+    # computed exactly instead of failing with an internal error.
+    response = evaluate(make_payload(30.0, [700, 720, 710], area=1e-25))
+    assert response.status_code == 200
+    body = json.loads(response.text, parse_float=Decimal)
+    assert body["strengths_mpa"] == [
+        Decimal("7000000000000000000000000000000.0"),
+        Decimal("7200000000000000000000000000000.0"),
+        Decimal("7100000000000000000000000000000.0"),
+    ]
+    assert body["mean_strength_mpa"] == Decimal("7100000000000000000000000000000.0")
+    assert body["passed"] is True
+    assert body["reasons"] == []
+
+
+def test_extreme_values_still_apply_release_criteria():
+    # Design 1e29 MPa: mean 3.1e28 < design and minimum 4.4e27 < 85.0% of
+    # design, so both reasons appear in the fixed order.
+    response = evaluate(make_payload(1e29, [1e30, 1e30, 1e29]))
+    assert response.status_code == 200
+    body = json.loads(response.text, parse_float=Decimal)
+    assert body["strengths_mpa"] == [
+        Decimal("44444444444444444444444444444.4"),
+        Decimal("44444444444444444444444444444.4"),
+        Decimal("4444444444444444444444444444.4"),
+    ]
+    assert body["mean_strength_mpa"] == Decimal("31111111111111111111111111111.1")
+    assert body["passed"] is False
+    assert body["reasons"] == ["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
+
+
+def test_high_precision_calibration_factor_is_echoed_exactly():
+    # 17 significant digits fit the 0.9500-1.0500 range but not a float64;
+    # the applied factor must be echoed exactly, not collapsed to 1.0.
+    payload = make_payload(30.0, [700, 720, 710])
+    payload["calibration_factor"] = "1.0000000000000001"
+    response = evaluate(payload)
+    assert response.status_code == 200
+    body = json.loads(response.text, parse_float=Decimal)
+    assert body["applied_calibration_factor"] == Decimal("1.0000000000000001")
+
+
+def test_high_precision_calibration_factor_is_applied_exactly():
+    # 707.62499999999999775 kN / 22500 mm² = 31.449999... MPa -> 31.4 MPa.
+    # Multiplying by 1.0000000000000001 first lifts the strength just past
+    # the 31.45 MPa rounding boundary -> 31.5 MPa.
+    uncalibrated = evaluate(make_payload(30.0, ["707.62499999999999775", 720, 720]))
+    assert uncalibrated.status_code == 200
+    assert uncalibrated.json()["strengths_mpa"] == [31.4, 32.0, 32.0]
+
+    payload = make_payload(30.0, ["707.62499999999999775", 720, 720])
+    payload["calibration_factor"] = "1.0000000000000001"
+    response = evaluate(payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [31.5, 32.0, 32.0]
+    assert body["mean_strength_mpa"] == 31.8
+
+
 INVALID_CALIBRATION_FACTORS = {
     "factor_below_range": 0.9499,
     "factor_above_range": 1.0501,
@@ -307,3 +385,27 @@ def test_invalid_payloads_return_422_without_partial_strengths(payload):
     assert "strengths_mpa" not in body
     assert "mean_strength_mpa" not in body
     assert "passed" not in body
+
+
+def test_non_finite_number_returns_422_not_internal_error():
+    # 1e309 overflows float64 when the server parses the JSON body; the
+    # resulting non-finite value is not a legal positive number, so the
+    # contractual 422 (not a 500) must come back.
+    response = httpx.post(
+        f"{BASE_URL}/evaluate",
+        content=(
+            '{"design_strength_mpa": 30.0, "specimens": ['
+            '{"area_mm2": 22500, "load_kn": 1e309},'
+            '{"area_mm2": 22500, "load_kn": 700},'
+            '{"area_mm2": 22500, "load_kn": 710}]}'
+        ),
+        headers={"Content-Type": "application/json"},
+        timeout=10,
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert "strengths_mpa" not in body
+    assert "mean_strength_mpa" not in body
+    assert "passed" not in body
+    locations = [error["loc"] for error in body["detail"]]
+    assert any(loc[-1] == "load_kn" for loc in locations)

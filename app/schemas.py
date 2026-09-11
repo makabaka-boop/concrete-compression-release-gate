@@ -1,11 +1,17 @@
 """Request/response contracts for the batch strength evaluation API."""
 
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, WithJsonSchema
 
 ReasonCode = Literal["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
+
+# Response Decimals are rendered as JSON numbers on the wire (see
+# main.ExactDecimalJSONResponse); keep the documented contract as "number"
+# even though pydantic's default serialization schema for Decimal is
+# "string".
+JsonNumber = Annotated[Decimal, WithJsonSchema({"type": "number"}, mode="serialization")]
 
 
 class Specimen(BaseModel):
@@ -33,15 +39,20 @@ class EvaluationRequest(BaseModel):
 
 
 class EvaluationResponse(BaseModel):
-    """Release decision for a batch."""
+    """Release decision for a batch.
 
-    strengths_mpa: list[float] = Field(description="三个试件的单块强度，MPa，保留 0.1")
-    mean_strength_mpa: float = Field(description="三项强度的算术平均值，MPa，保留 0.1")
+    Numeric fields stay Decimal so the exact computed values reach the
+    wire; converting them to float would silently drop precision (e.g. a
+    high-precision calibration factor would collapse to 1.0).
+    """
+
+    strengths_mpa: list[JsonNumber] = Field(description="三个试件的单块强度，MPa，保留 0.1")
+    mean_strength_mpa: JsonNumber = Field(description="三项强度的算术平均值，MPa，保留 0.1")
     passed: bool = Field(description="批次是否放行")
     reasons: list[ReasonCode] = Field(
         description="未通过原因，固定顺序 MEAN_BELOW_DESIGN、MIN_BELOW_85_PERCENT；通过时为空"
     )
-    applied_calibration_factor: float | None = Field(
+    applied_calibration_factor: JsonNumber | None = Field(
         default=None,
         description="实际应用的校准系数；仅当请求显式携带 calibration_factor 时返回，省略时不出现该字段",
     )
