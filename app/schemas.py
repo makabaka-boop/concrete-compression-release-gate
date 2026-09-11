@@ -1,10 +1,17 @@
 """Request/response contracts for the batch strength evaluation API."""
 
 import re
-from decimal import Decimal
+from decimal import Decimal, DefaultContext, localcontext
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, WithJsonSchema
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    WithJsonSchema,
+    model_validator,
+)
+from pydantic_core import PydanticCustomError
 
 ReasonCode = Literal["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
 
@@ -23,11 +30,94 @@ EvaluationId = Annotated[
 ]
 
 
-class Specimen(BaseModel):
-    """A single concrete specimen: loaded area and failure load."""
+def _exact_decimal_product(left: Decimal, right: Decimal) -> Decimal:
+    """Multiply two Decimals without context-precision rounding.
 
-    area_mm2: Decimal = Field(gt=0, description="受压面积，单位 mm²，必须大于 0")
+    The default 28-digit context would round the product of long
+    measurements (e.g. high-precision ``width_mm``/``depth_mm`` readings)
+    before it ever reaches the evaluation, silently changing the area;
+    widen the context so the converted area is the exact product.
+    """
+    with localcontext() as ctx:
+        required_prec = len(left.as_tuple().digits) + len(right.as_tuple().digits)
+        ctx.prec = max(DefaultContext.prec, required_prec)
+        return left * right
+
+
+class Specimen(BaseModel):
+    """A single concrete specimen: failure load plus its loaded face.
+
+    The loaded face is expressed exactly one of two ways:
+      * ``area_mm2`` directly, or
+      * the ``width_mm``/``depth_mm`` pair (both present and positive).
+
+    The two forms must not be mixed on one specimen. Requests are
+    normalized to :attr:`effective_area_mm2` before evaluation, so the
+    dimensions form is converted to an exact Decimal product and the rest
+    of the pipeline sees one uniform area value.
+    """
+
+    area_mm2: Decimal | None = Field(
+        default=None,
+        gt=0,
+        description="受压面积，单位 mm²，必须大于 0；与 width_mm/depth_mm 二选一，不能混用",
+    )
+    width_mm: Decimal | None = Field(
+        default=None,
+        gt=0,
+        description="受压面长度，单位 mm，必须大于 0；与 depth_mm 成对出现，换算面积采用 Decimal 精确乘积",
+    )
+    depth_mm: Decimal | None = Field(
+        default=None,
+        gt=0,
+        description="受压面宽度，单位 mm，必须大于 0；与 width_mm 成对出现",
+    )
     load_kn: Decimal = Field(gt=0, description="破坏载荷，单位 kN，必须大于 0")
+
+    @model_validator(mode="after")
+    def _validate_loaded_face_expression(self) -> "Specimen":
+        has_area = self.area_mm2 is not None
+        has_width = self.width_mm is not None
+        has_depth = self.depth_mm is not None
+
+        if has_area and (has_width or has_depth):
+            error = PydanticCustomError(
+                "mixed_area_and_dimensions",
+                "area_mm2 与 width_mm/depth_mm 不能混用，受压面只能选择其中一种表达方式",
+            )
+            raise ValidationError.from_exception_data(
+                type(self).__name__,
+                [{"type": error, "loc": ("area_mm2",), "input": self.area_mm2}],
+            )
+        if not has_area and (has_width != has_depth):
+            missing_field = "depth_mm" if has_width else "width_mm"
+            error = PydanticCustomError(
+                "missing_loaded_face_dimension",
+                "width_mm 与 depth_mm 必须成对提供受压面尺寸，缺少 {missing_field}",
+                {"missing_field": missing_field},
+            )
+            raise ValidationError.from_exception_data(
+                type(self).__name__,
+                [{"type": error, "loc": (missing_field,), "input": None}],
+            )
+        if not has_area and not has_width and not has_depth:
+            error = PydanticCustomError(
+                "missing_loaded_face",
+                "必须提供 area_mm2，或成对提供 width_mm 与 depth_mm",
+            )
+            raise ValidationError.from_exception_data(
+                type(self).__name__,
+                [{"type": error, "loc": ("area_mm2",), "input": None}],
+            )
+        return self
+
+    @property
+    def effective_area_mm2(self) -> Decimal:
+        """Area used downstream: the given area or width × depth (exact Decimal product)."""
+        if self.area_mm2 is not None:
+            return self.area_mm2
+        assert self.width_mm is not None and self.depth_mm is not None
+        return _exact_decimal_product(self.width_mm, self.depth_mm)
 
 
 class EvaluationRequest(BaseModel):

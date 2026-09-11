@@ -45,6 +45,15 @@ def make_payload(design_strength, loads, area=AREA_MM2):
     }
 
 
+def make_dimensions_payload(design_strength, loads, width=150.0, depth=150.0):
+    return {
+        "design_strength_mpa": design_strength,
+        "specimens": [
+            {"width_mm": width, "depth_mm": depth, "load_kn": load} for load in loads
+        ],
+    }
+
+
 def evaluate(payload):
     return httpx.post(f"{BASE_URL}/evaluate", json=payload, timeout=10)
 
@@ -97,6 +106,112 @@ def test_numerically_equal_representations_are_the_same_request():
     replay_body = replay.json()
     assert replay_body["replayed"] is True
     assert without_replayed(replay_body) == without_replayed(first.json())
+
+
+def test_equivalent_area_and_dimensions_replay_first_result():
+    # First submission enters the loaded face as an area; the retry enters
+    # the same face as width/depth. Normalization to effective area makes
+    # them the same business input, so the retry replays instead of raising
+    # a false 409 conflict.
+    evaluation_id = fresh_id()
+    first_payload = make_payload(30.0, [800, 800, 500])  # failing batch
+    first_payload["evaluation_id"] = evaluation_id
+    first = evaluate(first_payload)
+    assert first.status_code == 200
+    first_body = first.json()
+    assert first_body["replayed"] is False
+    assert first_body["passed"] is False
+    assert first_body["reasons"] == ["MIN_BELOW_85_PERCENT"]
+
+    dimensions_payload = make_dimensions_payload(30.0, [800, 800, 500])
+    dimensions_payload["evaluation_id"] = evaluation_id
+    replay = evaluate(dimensions_payload)
+    assert replay.status_code == 200
+    replay_body = replay.json()
+    assert replay_body["replayed"] is True
+    assert without_replayed(replay_body) == without_replayed(first_body)
+
+
+def test_equivalent_area_and_dimensions_replay_in_either_order():
+    # Same contract in reverse: dimensions first, equivalent area retry.
+    evaluation_id = fresh_id()
+    first_payload = make_dimensions_payload(30.0, [700, 720, 710])
+    first_payload["evaluation_id"] = evaluation_id
+    first = evaluate(first_payload)
+    assert first.status_code == 200
+    assert first.json()["replayed"] is False
+
+    area_payload = make_payload(30.0, [700, 720, 710])
+    area_payload["evaluation_id"] = evaluation_id
+    replay = evaluate(area_payload)
+    assert replay.status_code == 200
+    replay_body = replay.json()
+    assert replay_body["replayed"] is True
+    assert without_replayed(replay_body) == without_replayed(first.json())
+
+
+def test_non_equivalent_dimensions_under_same_id_still_conflict():
+    # Conflict protection survives normalization: a different face size is
+    # a different business input even in dimensions form.
+    evaluation_id = fresh_id()
+    first_payload = make_dimensions_payload(30.0, [700, 720, 710], width=150.0, depth=150.0)
+    first_payload["evaluation_id"] = evaluation_id
+    first = evaluate(first_payload)
+    assert first.status_code == 200
+    assert first.json()["replayed"] is False
+
+    conflicting_payload = make_dimensions_payload(
+        30.0, [700, 720, 710], width=100.0, depth=200.0
+    )
+    conflicting_payload["evaluation_id"] = evaluation_id
+    conflict = evaluate(conflicting_payload)
+    assert conflict.status_code == 409
+    assert conflict.json()["evaluation_id"] == evaluation_id
+
+    # The first result still replays under its original (equivalent) input.
+    replay = evaluate(first_payload)
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+
+
+def test_invalid_dimensions_with_id_do_not_occupy_the_identifier():
+    # A half-entered face (width without depth), a mixed expression and a
+    # non-positive dimension all fail with 422 *before* the ledger is
+    # written; the same id then works as a genuine first submission.
+    evaluation_id = fresh_id()
+
+    missing_depth = make_dimensions_payload(30.0, [700, 720, 710])
+    del missing_depth["specimens"][0]["depth_mm"]
+    missing_depth["evaluation_id"] = evaluation_id
+    rejected = evaluate(missing_depth)
+    assert rejected.status_code == 422
+
+    mixed = make_dimensions_payload(30.0, [700, 720, 710])
+    mixed["specimens"][1]["area_mm2"] = 22500
+    mixed["evaluation_id"] = evaluation_id
+    also_rejected = evaluate(mixed)
+    assert also_rejected.status_code == 422
+
+    zero_width = make_dimensions_payload(30.0, [700, 720, 710])
+    zero_width["specimens"][2]["width_mm"] = 0
+    zero_width["evaluation_id"] = evaluation_id
+    still_rejected = evaluate(zero_width)
+    assert still_rejected.status_code == 422
+
+    valid_payload = make_dimensions_payload(30.0, [700, 720, 710])
+    valid_payload["evaluation_id"] = evaluation_id
+    first = evaluate(valid_payload)
+    assert first.status_code == 200
+    first_body = first.json()
+    assert first_body["replayed"] is False
+    assert first_body["strengths_mpa"] == [31.1, 32.0, 31.6]
+
+    # Replay through the numerically equivalent area expression.
+    equivalent_area_payload = make_payload(30.0, [700, 720, 710])
+    equivalent_area_payload["evaluation_id"] = evaluation_id
+    replay = evaluate(equivalent_area_payload)
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
 
 
 def test_conflicting_input_returns_409_and_keeps_original_record():

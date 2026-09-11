@@ -34,12 +34,16 @@ API_BASE_URL=http://localhost:8000 pytest tests/ -v
 | --- | --- | --- | --- |
 | `design_strength_mpa` | number | MPa | 设计强度 |
 | `specimens` | array（恰好 3 项） | — | 试件列表 |
-| `specimens[].area_mm2` | number | mm² | 受压面积 |
+| `specimens[].area_mm2` | number | mm² | 受压面积（方式一，直接录入） |
+| `specimens[].width_mm` | number | mm | 受压面长度（方式二，与 `depth_mm` 成对录入） |
+| `specimens[].depth_mm` | number | mm | 受压面宽度（方式二，与 `width_mm` 成对录入） |
 | `specimens[].load_kn` | number | kN | 破坏载荷 |
 | `calibration_factor` | number，可选 | — | 压力机校准载荷修正系数，范围 0.9500–1.0500（含边界）；省略时按 1 处理，显式 `null` 视为非法 |
 | `evaluation_id` | string，可选 | — | 幂等标识（非空、最长 128 字符）；携带时启用重试去重，详见「幂等与台账」 |
 
-示例：
+每块试件的受压面**二选一**表达：要么直接给 `area_mm2`，要么成对给 `width_mm` 与 `depth_mm`（服务端以 `Decimal` 精确乘积 `width_mm × depth_mm` 换算面积）；同一试件上两种方式不能混用，尺寸不能缺项，三个尺寸/面积字段均须为正数。一批三块试件之间允许各自选择不同方式。请求进入裁决前统一归一化为有效面积，因此尺寸录入与等价面积录入得到完全相同的结果。
+
+示例一（直接录入面积，150 mm 标准立方试件）：
 
 ```bash
 curl -X POST http://localhost:8000/evaluate \
@@ -54,7 +58,22 @@ curl -X POST http://localhost:8000/evaluate \
       }'
 ```
 
-响应 `200 OK`（平均值达标，但最低单值低于设计强度的 85.0%，批次不放行）：
+示例二（只记录受压面长、宽，由服务端换算面积；与示例一数值等价、结论一致）：
+
+```bash
+curl -X POST http://localhost:8000/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "design_strength_mpa": 30.0,
+        "specimens": [
+          {"width_mm": 150, "depth_mm": 150, "load_kn": 800},
+          {"width_mm": 150, "depth_mm": 150, "load_kn": 800},
+          {"width_mm": 150, "depth_mm": 150, "load_kn": 500}
+        ]
+      }'
+```
+
+两个请求返回相同的 `200 OK`（平均值达标，但最低单值低于设计强度的 85.0%，批次不放行）：
 
 ```json
 {
@@ -108,11 +127,11 @@ curl -X POST http://localhost:8000/evaluate \
 
 实验室网络重试可能让同一组试件被重复裁决。请求携带 `evaluation_id` 时，接口按以下规则去重并留痕：
 
-1. **请求指纹**：以规范化后的设计强度、三块试件（面积、载荷，含顺序）与校准系数生成指纹。数值按 `Decimal` 值规范化——`30.0`、`30.00`、`"3E+1"` 等值不同形，视为同一请求；但显式 `calibration_factor: 1.0` 与省略系数不同（前者响应多 `applied_calibration_factor` 字段）。
+1. **请求指纹**：以归一化后的设计强度、三块试件（**有效面积**、载荷，含顺序）与校准系数生成指纹。请求进入裁决前，`width_mm × depth_mm` 已按 `Decimal` 精确乘积换算为有效面积，因此用面积或等价尺寸录入同一受压面产生相同指纹——尺寸首录后可用等价面积回放，反之亦然，不会误报冲突。数值按 `Decimal` 值规范化——`30.0`、`30.00`、`"3E+1"` 等值不同形，视为同一请求；但显式 `calibration_factor: 1.0` 与省略系数不同（前者响应多 `applied_calibration_factor` 字段）。
 2. **首次提交**：调用原有 Decimal 裁决服务计算，将 `evaluation_id`、指纹与完整结果写入本地 SQLite 台账，返回结果并带 `replayed: false`。
 3. **相同重试**：`evaluation_id` 与业务输入均与首次一致时，不重新计算，直接返回首次保存的结果并带 `replayed: true`。
 4. **标识冲突**：`evaluation_id` 已对应不同业务输入时返回 `409 Conflict`，错误体指出 `evaluation_id` 冲突，**已保存的首次结果不被覆盖**。
-5. **非法请求**：试件或校准系数非法时仍返回 `422`，且在写入台账之前——不会留下占位记录，同一标识修正后可正常首次提交。
+5. **非法请求**：试件（含尺寸缺项、面积/尺寸混用、非正尺寸）或校准系数非法时仍返回 `422`，且在写入台账之前——不会留下占位记录，同一标识修正尺寸后可正常首次提交。
 6. **未携带标识**：行为与扩展前完全一致——即时计算、不写台账、响应不含 `replayed` 字段。
 
 携带标识的示例：
@@ -131,7 +150,7 @@ curl -X POST http://localhost:8000/evaluate \
       }'
 ```
 
-首次响应 `200 OK`：`{"strengths_mpa":[31.1,32.0,31.6],"mean_strength_mpa":31.6,"passed":true,"reasons":[],"replayed":false}`；相同请求重试时同一结果带 `"replayed":true`。
+首次响应 `200 OK`：`{"strengths_mpa":[31.1,32.0,31.6],"mean_strength_mpa":31.6,"passed":true,"reasons":[],"replayed":false}`；相同请求重试时同一结果带 `"replayed":true`。重试时也可把任一试件的 `area_mm2` 换成数值等价的 `width_mm`/`depth_mm`（例如 22500 ↔ 150 × 150），归一化后指纹一致，仍回放首次结果。
 
 ### `GET /health`
 
@@ -151,19 +170,20 @@ API_BASE_URL=http://localhost:8000 pytest tests/ -v
 ## 计算规则
 
 1. 若请求显式携带 `calibration_factor`，先将每块试件的 `load_kn` 以 `Decimal` 乘以该系数得到校准载荷；校准载荷**不做任何中间舍入**。省略系数时按 1 处理，计算结果与未扩展前的契约完全一致。
-2. 单块强度 = `load_kn × 1000 ÷ area_mm2`（kN 换算为 N 后除以 mm² 得 MPa；携带系数时使用校准后的载荷），按 **ROUND_HALF_UP** 保留 **0.1 MPa**。
-3. 平均强度 = 三个**舍入后**单块强度的算术平均值，再按 ROUND_HALF_UP 保留 0.1 MPa。
-4. 放行需同时满足（等于阈值计入通过）：
+2. 裁决开始前统一归一化受压面：直接录入 `area_mm2` 时原样使用；以 `width_mm`/`depth_mm` 录入时，两者的 `Decimal` 精确乘积（不经浮点、不受 28 位默认上下文截断）即为有效面积。
+3. 单块强度 = `load_kn × 1000 ÷ area_mm2`（kN 换算为 N 后除以有效面积 mm² 得 MPa；携带系数时使用校准后的载荷），按 **ROUND_HALF_UP** 保留 **0.1 MPa**。
+4. 平均强度 = 三个**舍入后**单块强度的算术平均值，再按 ROUND_HALF_UP 保留 0.1 MPa。
+5. 放行需同时满足（等于阈值计入通过）：
    - 平均强度 ≥ 设计强度；
    - 最低单块强度 ≥ 设计强度的 **85.0%**。
-5. 未通过时 `reasons` 包含全部未满足条件，固定顺序：
+6. 未通过时 `reasons` 包含全部未满足条件，固定顺序：
    - `MEAN_BELOW_DESIGN` — 平均强度低于设计强度；
    - `MIN_BELOW_85_PERCENT` — 最低单值低于设计强度的 85.0%。
    两者同时不满足时返回两项，通过时为空数组。
 
 ## 错误处理
 
-字段缺失、试件数量不为 3、数值非正数或无法解析为数值时，统一返回 `422 Unprocessable Entity`，响应中不包含任何部分强度结果。`calibration_factor` 越出 0.9500–1.0500、非数值或显式 `null` 时同样返回 422，错误位置（`detail[].loc`）指向 `calibration_factor`。`evaluation_id` 为空字符串、纯空白或非字符串时同样返回 422。
+字段缺失、试件数量不为 3、数值非正数或无法解析为数值时，统一返回 `422 Unprocessable Entity`，响应中不包含任何部分强度结果。每块试件未表达受压面（`area_mm2` 与 `width_mm`/`depth_mm` 全缺）、尺寸只给单边（仅 `width_mm` 或仅 `depth_mm`）、或同一试件混用面积与尺寸（同时给 `area_mm2` 与任一尺寸）时同样返回 422；错误位置（`detail[].loc`）指向对应试件下标及字段——缺边指向所缺的 `width_mm`/`depth_mm`，混用或完全未表达指向 `area_mm2`。`calibration_factor` 越出 0.9500–1.0500、非数值或显式 `null` 时同样返回 422，错误位置指向 `calibration_factor`。`evaluation_id` 为空字符串、纯空白或非字符串时同样返回 422。
 
 携带的 `evaluation_id` 已对应不同业务输入时返回 `409 Conflict`，错误体 `detail` 说明标识冲突并回显该 `evaluation_id`；已保存的首次结果不被覆盖，使用原业务输入重试仍可取回首次结果。
 
@@ -172,7 +192,7 @@ API_BASE_URL=http://localhost:8000 pytest tests/ -v
 ```
 app/
   main.py      # FastAPI 入口，POST /evaluate 与 GET /health
-  schemas.py   # Pydantic 请求/响应契约（正数校验、恰好三个试件、可选校准系数、可选幂等标识）
+  schemas.py   # Pydantic 请求/响应契约（正数校验、恰好三个试件、受压面面积/尺寸二选一、可选校准系数、可选幂等标识）
   service.py   # Decimal 强度计算与批次放行裁决
   store.py     # SQLite 幂等台账：请求指纹、记录查询与写入
 tests/

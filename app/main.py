@@ -89,9 +89,17 @@ def health() -> dict[str, str]:
 
 @app.post("/evaluate", response_model=EvaluationResponse, response_model_exclude_none=True)
 def evaluate(request: EvaluationRequest) -> Response:
+    # Normalize each specimen to its effective loaded area (an explicit
+    # area_mm2, or the exact Decimal product of width_mm x depth_mm) before
+    # anything downstream: calibration, strength rounding and the ledger
+    # fingerprint all work from the same uniform area value.
+    effective_specimens = [
+        SpecimenInput(area_mm2=s.effective_area_mm2, load_kn=s.load_kn)
+        for s in request.specimens
+    ]
     result = evaluate_batch(
         request.design_strength_mpa,
-        [SpecimenInput(area_mm2=s.area_mm2, load_kn=s.load_kn) for s in request.specimens],
+        effective_specimens,
         calibration_factor=request.calibration_factor,
     )
     response = EvaluationResponse(
@@ -117,7 +125,7 @@ def evaluate(request: EvaluationRequest) -> Response:
 
     fingerprint = store.build_fingerprint(
         request.design_strength_mpa,
-        [(s.area_mm2, s.load_kn) for s in request.specimens],
+        [(specimen.area_mm2, specimen.load_kn) for specimen in effective_specimens],
         request.calibration_factor,
         "calibration_factor" in request.model_fields_set,
     )

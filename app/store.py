@@ -2,9 +2,13 @@
 
 When a request carries an ``evaluation_id``, the endpoint computes a
 fingerprint over the normalized business input (design strength, the three
-specimens, and the calibration factor — including whether the factor was
-explicitly provided), then persists ``evaluation_id -> (fingerprint,
-response body)`` in a local SQLite database.
+specimens' *effective* areas and loads, and the calibration factor —
+including whether the factor was explicitly provided), then persists
+``evaluation_id -> (fingerprint, response body)`` in a local SQLite
+database. A specimen whose loaded face was entered as ``width_mm`` x
+``depth_mm`` is converted to its effective area before fingerprinting, so
+an area entry and a numerically equivalent dimensions entry produce the
+same fingerprint and replay instead of a false conflict.
 
 Replay semantics:
 

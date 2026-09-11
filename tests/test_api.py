@@ -39,6 +39,15 @@ def make_payload(design_strength, loads, area=AREA_MM2):
     }
 
 
+def make_dimensions_payload(design_strength, loads, width=150.0, depth=150.0):
+    return {
+        "design_strength_mpa": design_strength,
+        "specimens": [
+            {"width_mm": width, "depth_mm": depth, "load_kn": load} for load in loads
+        ],
+    }
+
+
 def evaluate(payload):
     return httpx.post(f"{BASE_URL}/evaluate", json=payload, timeout=10)
 
@@ -224,6 +233,97 @@ def test_legacy_request_without_calibration_is_fully_compatible():
     assert body["reasons"] == []
 
 
+def test_dimensions_input_passes_like_equivalent_area():
+    # 150 mm x 150 mm face == 22500 mm²: the dimensions form must reach the
+    # exact same passing verdict as the area form.
+    response = evaluate(make_dimensions_payload(30.0, [700, 720, 710]))
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"strengths_mpa", "mean_strength_mpa", "passed", "reasons"}
+    assert body["strengths_mpa"] == [31.1, 32.0, 31.6]
+    assert body["mean_strength_mpa"] == 31.6
+    assert body["passed"] is True
+    assert body["reasons"] == []
+
+    area_response = evaluate(make_payload(30.0, [700, 720, 710]))
+    assert area_response.json() == body
+
+
+def test_dimensions_input_fails_like_equivalent_area():
+    # Same headline scenario entered as face dimensions: the failing
+    # outlier below 85.0% must produce the identical failing verdict.
+    response = evaluate(make_dimensions_payload(30.0, [800, 800, 500]))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [35.6, 35.6, 22.2]
+    assert body["mean_strength_mpa"] == 31.1
+    assert body["passed"] is False
+    assert body["reasons"] == ["MIN_BELOW_85_PERCENT"]
+
+    area_response = evaluate(make_payload(30.0, [800, 800, 500]))
+    assert area_response.json() == body
+
+
+def test_non_square_dimensions_compute_width_times_depth():
+    # 100 mm x 200 mm face == 20000 mm²: 700 kN -> 35.0 MPa.
+    response = evaluate(make_dimensions_payload(30.0, [700, 720, 710], width=100.0, depth=200.0))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [35.0, 36.0, 35.5]
+    assert body["mean_strength_mpa"] == 35.5
+    assert body["passed"] is True
+
+    area_response = evaluate(make_payload(30.0, [700, 720, 710], area=20000))
+    assert area_response.json() == body
+
+
+def test_dimensions_area_is_exact_decimal_product_not_float():
+    # 150.1 mm x 150.2 mm = 22545.02 mm² exactly; a float conversion would
+    # carry ...019999... artifacts. Compare against the area entered as the
+    # exact product string.
+    response = evaluate(make_dimensions_payload(30.0, [800, 800, 800], width=150.1, depth=150.2))
+    assert response.status_code == 200
+    body = response.json()
+    # 800_000 / 22545.02 = 35.4845... -> 35.5 MPa
+    assert body["strengths_mpa"] == [35.5, 35.5, 35.5]
+
+    area_response = evaluate(
+        make_payload(30.0, [800, 800, 800], area="22545.02")
+    )
+    assert area_response.status_code == 200
+    assert area_response.json() == body
+
+
+def test_area_and_dimensions_forms_may_coexist_within_a_batch():
+    # The two forms must not be mixed *within one specimen*; different
+    # specimens in the same batch may use different forms.
+    payload = {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"width_mm": 150, "depth_mm": 150, "load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 720},
+            {"area_mm2": 22500, "load_kn": 710},
+        ],
+    }
+    response = evaluate(payload)
+    assert response.status_code == 200
+    assert response.json()["strengths_mpa"] == [31.1, 32.0, 31.6]
+
+
+def test_dimensions_with_calibration_flow_through_normalized_area():
+    # Calibration must apply on top of the dimensions-derived area exactly
+    # as it does for the equivalent area request.
+    payload = make_dimensions_payload(30.0, [660, 670, 680])
+    payload["calibration_factor"] = 1.01
+    response = evaluate(payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [29.6, 30.1, 30.5]
+    assert body["mean_strength_mpa"] == 30.1
+    assert body["passed"] is True
+    assert body["applied_calibration_factor"] == 1.01
+
+
 def test_extremely_large_loads_return_complete_verdict():
     # 1e30 kN is legal (positive) but each strength 1e30*1000/22500 MPa has
     # 30 significant digits — beyond the default 28-digit decimal context;
@@ -374,6 +474,62 @@ INVALID_PAYLOADS = {
             {"area_mm2": 22500, "load_kn": 710},
         ],
     },
+    "missing_both_dimensions": {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 710},
+        ],
+    },
+    "missing_depth_only": {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"area_mm2": 22500, "load_kn": 700},
+            {"width_mm": 150, "load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 710},
+        ],
+    },
+    "missing_width_only": {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"area_mm2": 22500, "load_kn": 700},
+            {"depth_mm": 150, "load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 710},
+        ],
+    },
+    "mixed_area_and_dimensions": {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"area_mm2": 22500, "load_kn": 700},
+            {"area_mm2": 22500, "width_mm": 150, "depth_mm": 150, "load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 710},
+        ],
+    },
+    "zero_width": {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"width_mm": 0, "depth_mm": 150, "load_kn": 700},
+            {"width_mm": 150, "depth_mm": 150, "load_kn": 700},
+            {"width_mm": 150, "depth_mm": 150, "load_kn": 710},
+        ],
+    },
+    "negative_depth": {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"width_mm": 150, "depth_mm": -150, "load_kn": 700},
+            {"width_mm": 150, "depth_mm": 150, "load_kn": 700},
+            {"width_mm": 150, "depth_mm": 150, "load_kn": 710},
+        ],
+    },
+    "non_numeric_width": {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"width_mm": "abc", "depth_mm": 150, "load_kn": 700},
+            {"width_mm": 150, "depth_mm": 150, "load_kn": 700},
+            {"width_mm": 150, "depth_mm": 150, "load_kn": 710},
+        ],
+    },
 }
 
 
@@ -385,6 +541,40 @@ def test_invalid_payloads_return_422_without_partial_strengths(payload):
     assert "strengths_mpa" not in body
     assert "mean_strength_mpa" not in body
     assert "passed" not in body
+
+
+@pytest.mark.parametrize(
+    "specimen_index,bad_specimen,pointed_field",
+    [
+        # Missing paired dimension: error points at the missing field.
+        (1, {"width_mm": 150, "load_kn": 700}, "depth_mm"),
+        (1, {"depth_mm": 150, "load_kn": 700}, "width_mm"),
+        # No area expression at all: error points at area_mm2.
+        (2, {"load_kn": 700}, "area_mm2"),
+        # Mixed expressions: error points at area_mm2.
+        (0, {"area_mm2": 22500, "width_mm": 150, "depth_mm": 150, "load_kn": 700}, "area_mm2"),
+        # Non-positive dimension: field-constraint error on that field.
+        (2, {"width_mm": 0, "depth_mm": 150, "load_kn": 700}, "width_mm"),
+        (0, {"width_mm": 150, "depth_mm": -1, "load_kn": 700}, "depth_mm"),
+    ],
+)
+def test_invalid_dimensions_422_loc_points_at_specimen_and_field(
+    specimen_index, bad_specimen, pointed_field
+):
+    specimens = [{"area_mm2": 22500, "load_kn": 700} for _ in range(3)]
+    specimens[specimen_index] = bad_specimen
+    payload = {"design_strength_mpa": 30.0, "specimens": specimens}
+    response = evaluate(payload)
+    assert response.status_code == 422
+    locations = [tuple(error["loc"]) for error in response.json()["detail"]]
+    # FastAPI prefixes body errors with "body"; the error location still
+    # carries the specimen index and the offending field.
+    assert any(
+        "specimens" in loc
+        and specimen_index in loc
+        and loc[-1] == pointed_field
+        for loc in locations
+    ), locations
 
 
 def test_non_finite_number_returns_422_not_internal_error():
