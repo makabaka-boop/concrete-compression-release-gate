@@ -6,6 +6,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     Field,
     ValidationError,
     WithJsonSchema,
@@ -34,6 +35,32 @@ EvaluationId = Annotated[
     str,
     Field(min_length=1, max_length=128, pattern=re.compile(r"\S")),
 ]
+
+
+def _reject_numeric_strings(value: Any) -> Any:
+    """Reject numeric strings so specimen numerics stay JSON numbers.
+
+    The contract types every specimen numeric as ``number``; pydantic's
+    lax mode would silently coerce strings such as ``"150"`` or
+    ``"22500.00"`` into Decimals, letting wrongly typed requests reach
+    the evaluation. Reject them here so the type violation is reported
+    (422) before any calculation. Non-string values flow through to the
+    usual Decimal validation unchanged — ints, floats (converted via
+    their shortest repr, so 1.01 stays exactly 1.01) and Decimals remain
+    valid, and booleans keep failing the stock Decimal type check.
+    """
+    if isinstance(value, str):
+        raise PydanticCustomError(
+            "decimal_type",
+            "必须是 JSON 数字（number 类型），不接受数字字符串",
+        )
+    return value
+
+
+# Specimen numeric fields are contractually JSON numbers: without this
+# annotation, lax Decimal coercion would let "150"-style strings through
+# the type contract and into the strength evaluation.
+SpecimenNumber = Annotated[Decimal, BeforeValidator(_reject_numeric_strings)]
 
 
 def _exact_decimal_product(left: Decimal, right: Decimal) -> Decimal:
@@ -125,24 +152,29 @@ class Specimen(BaseModel):
     normalized to :attr:`effective_area_mm2` before evaluation, so the
     dimensions form is converted to an exact Decimal product and the rest
     of the pipeline sees one uniform area value.
+
+    Every numeric field is a strict JSON ``number``: numeric strings such
+    as ``"150"`` are rejected with a type error before any calculation.
     """
 
-    area_mm2: Decimal | None = Field(
+    area_mm2: SpecimenNumber | None = Field(
         default=None,
         gt=0,
-        description="受压面积，单位 mm²，必须大于 0；与 width_mm/depth_mm 二选一，不能混用",
+        description="受压面积，单位 mm²，必须大于 0；与 width_mm/depth_mm 二选一，不能混用；只接受 JSON 数字",
     )
-    width_mm: Decimal | None = Field(
+    width_mm: SpecimenNumber | None = Field(
         default=None,
         gt=0,
-        description="受压面长度，单位 mm，必须大于 0；与 depth_mm 成对出现，换算面积采用 Decimal 精确乘积",
+        description="受压面长度，单位 mm，必须大于 0；与 depth_mm 成对出现，换算面积采用 Decimal 精确乘积；只接受 JSON 数字",
     )
-    depth_mm: Decimal | None = Field(
+    depth_mm: SpecimenNumber | None = Field(
         default=None,
         gt=0,
-        description="受压面宽度，单位 mm，必须大于 0；与 width_mm 成对出现",
+        description="受压面宽度，单位 mm，必须大于 0；与 width_mm 成对出现；只接受 JSON 数字",
     )
-    load_kn: Decimal = Field(gt=0, description="破坏载荷，单位 kN，必须大于 0")
+    load_kn: SpecimenNumber = Field(
+        gt=0, description="破坏载荷，单位 kN，必须大于 0；只接受 JSON 数字"
+    )
 
     @model_validator(mode="wrap")
     @classmethod

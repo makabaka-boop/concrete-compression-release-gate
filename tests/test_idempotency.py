@@ -90,15 +90,18 @@ def test_numerically_equal_representations_are_the_same_request():
     assert first.status_code == 200
     assert first.json()["replayed"] is False
 
-    # Same Decimal values, different JSON representations: 30.00, string
-    # numbers, exponent notation, 22500.0 for the area.
+    # Same Decimal values, different JSON representations: "30.00" string
+    # for the design strength (batch-level numerics stay
+    # representation-flexible), 22500.0 for the area, exponent notation.
+    # Specimen numerics themselves must be JSON numbers — string forms
+    # like "22500" are rejected with 422.
     equivalent_payload = {
         "design_strength_mpa": "30.00",
         "evaluation_id": evaluation_id,
         "specimens": [
-            {"area_mm2": 22500.0, "load_kn": "7.0E2"},
-            {"area_mm2": "22500.00", "load_kn": 720.0},
-            {"area_mm2": 2.25e4, "load_kn": "710.000"},
+            {"area_mm2": 22500.0, "load_kn": 7.0E2},
+            {"area_mm2": 22500.00, "load_kn": 720.0},
+            {"area_mm2": 2.25e4, "load_kn": 710.000},
         ],
     }
     replay = evaluate(equivalent_payload)

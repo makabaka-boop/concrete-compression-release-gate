@@ -43,6 +43,8 @@ API_BASE_URL=http://localhost:8000 pytest tests/ -v
 
 每块试件的受压面**二选一**表达：要么直接给 `area_mm2`，要么成对给 `width_mm` 与 `depth_mm`（服务端以 `Decimal` 精确乘积 `width_mm × depth_mm` 换算面积）；同一试件上两种方式不能混用，尺寸不能缺项，三个尺寸/面积字段均须为正数。一批三块试件之间允许各自选择不同方式。请求进入裁决前统一归一化为有效面积，因此尺寸录入与等价面积录入得到完全相同的结果。
 
+试件数值字段（`area_mm2`、`width_mm`、`depth_mm`、`load_kn`）严格执行 JSON `number` 类型契约：数字字符串（如 `"22500"`、`"150"`）或其他非数字类型一律在计算开始前返回 `422`，错误位置指向对应试件下标及字段。
+
 示例一（直接录入面积，150 mm 标准立方试件）：
 
 ```bash
@@ -127,7 +129,7 @@ curl -X POST http://localhost:8000/evaluate \
 
 实验室网络重试可能让同一组试件被重复裁决。请求携带 `evaluation_id` 时，接口按以下规则去重并留痕：
 
-1. **请求指纹**：以归一化后的设计强度、三块试件（**有效面积**、载荷，含顺序）与校准系数生成指纹。请求进入裁决前，`width_mm × depth_mm` 已按 `Decimal` 精确乘积换算为有效面积，因此用面积或等价尺寸录入同一受压面产生相同指纹——尺寸首录后可用等价面积回放，反之亦然，不会误报冲突。数值按 `Decimal` 值规范化——`30.0`、`30.00`、`"3E+1"` 等值不同形，视为同一请求；但显式 `calibration_factor: 1.0` 与省略系数不同（前者响应多 `applied_calibration_factor` 字段）。
+1. **请求指纹**：以归一化后的设计强度、三块试件（**有效面积**、载荷，含顺序）与校准系数生成指纹。请求进入裁决前，`width_mm × depth_mm` 已按 `Decimal` 精确乘积换算为有效面积，因此用面积或等价尺寸录入同一受压面产生相同指纹——尺寸首录后可用等价面积回放，反之亦然，不会误报冲突。数值按 `Decimal` 值规范化——`30.0`、`30.00`、`3E+1` 等值不同形，视为同一请求；但显式 `calibration_factor: 1.0` 与省略系数不同（前者响应多 `applied_calibration_factor` 字段）。
 2. **首次提交**：调用原有 Decimal 裁决服务计算，将 `evaluation_id`、指纹与完整结果写入本地 SQLite 台账，返回结果并带 `replayed: false`。
 3. **相同重试**：`evaluation_id` 与业务输入均与首次一致时，不重新计算，直接返回首次保存的结果并带 `replayed: true`。
 4. **标识冲突**：`evaluation_id` 已对应不同业务输入时返回 `409 Conflict`，错误体指出 `evaluation_id` 冲突，**已保存的首次结果不被覆盖**。
@@ -183,7 +185,7 @@ API_BASE_URL=http://localhost:8000 pytest tests/ -v
 
 ## 错误处理
 
-字段缺失、试件数量不为 3、数值非正数或无法解析为数值时，统一返回 `422 Unprocessable Entity`，响应中不包含任何部分强度结果。每块试件未表达受压面（`area_mm2` 与 `width_mm`/`depth_mm` 全缺）、尺寸只给单边（仅 `width_mm` 或仅 `depth_mm`）、或同一试件混用面积与尺寸（同时给 `area_mm2` 与任一尺寸）时同样返回 422；错误位置（`detail[].loc`）指向对应试件下标及字段——缺边指向所缺的 `width_mm`/`depth_mm`，混用或完全未表达指向 `area_mm2`。`calibration_factor` 越出 0.9500–1.0500、非数值或显式 `null` 时同样返回 422，错误位置指向 `calibration_factor`。`evaluation_id` 为空字符串、纯空白或非字符串时同样返回 422。
+字段缺失、试件数量不为 3、数值非正数或无法解析为数值时，统一返回 `422 Unprocessable Entity`，响应中不包含任何部分强度结果。试件数值字段（`area_mm2`、`width_mm`、`depth_mm`、`load_kn`）只接受 JSON 数字，数字字符串（如 `"22500"`）同样返回 422，错误位置指向对应试件下标及字段。每块试件未表达受压面（`area_mm2` 与 `width_mm`/`depth_mm` 全缺）、尺寸只给单边（仅 `width_mm` 或仅 `depth_mm`）、或同一试件混用面积与尺寸（同时给 `area_mm2` 与任一尺寸）时同样返回 422；错误位置（`detail[].loc`）指向对应试件下标及字段——缺边指向所缺的 `width_mm`/`depth_mm`，混用或完全未表达指向 `area_mm2`。`calibration_factor` 越出 0.9500–1.0500、非数值或显式 `null` 时同样返回 422，错误位置指向 `calibration_factor`。`evaluation_id` 为空字符串、纯空白或非字符串时同样返回 422。
 
 携带的 `evaluation_id` 已对应不同业务输入时返回 `409 Conflict`，错误体 `detail` 说明标识冲突并回显该 `evaluation_id`；已保存的首次结果不被覆盖，使用原业务输入重试仍可取回首次结果。
 
@@ -192,12 +194,13 @@ API_BASE_URL=http://localhost:8000 pytest tests/ -v
 ```
 app/
   main.py      # FastAPI 入口，POST /evaluate 与 GET /health
-  schemas.py   # Pydantic 请求/响应契约（正数校验、恰好三个试件、受压面面积/尺寸二选一、可选校准系数、可选幂等标识）
+  schemas.py   # Pydantic 请求/响应契约（正数校验、恰好三个试件、受压面面积/尺寸二选一、试件数值严格 JSON 数字类型、可选校准系数、可选幂等标识）
   service.py   # Decimal 强度计算与批次放行裁决
   store.py     # SQLite 幂等台账：请求指纹、记录查询与写入
 tests/
-  test_api.py          # 通过真实 HTTP 验证计算与契约的 pytest 用例
-  test_idempotency.py  # 通过真实 HTTP 验证幂等回放、冲突与隔离的 pytest 用例
+  test_api.py             # 通过真实 HTTP 验证计算与契约的 pytest 用例
+  test_idempotency.py     # 通过真实 HTTP 验证幂等回放、冲突与隔离的 pytest 用例
+  test_service_extremes.py  # 极端量级场景的 Decimal 服务层单元测试（该量级无法以 JSON 数字经 HTTP 表达）
 Dockerfile     # python:3.12-slim 镜像
 compose.yaml   # api 服务（API_PORT 可覆盖，ledger 卷保存台账）+ verify 一次性服务
 ```

@@ -280,7 +280,7 @@ def test_non_square_dimensions_compute_width_times_depth():
 def test_dimensions_area_is_exact_decimal_product_not_float():
     # 150.1 mm x 150.2 mm = 22545.02 mm² exactly; a float conversion would
     # carry ...019999... artifacts. Compare against the area entered as the
-    # exact product string.
+    # exact product number.
     response = evaluate(make_dimensions_payload(30.0, [800, 800, 800], width=150.1, depth=150.2))
     assert response.status_code == 200
     body = response.json()
@@ -288,7 +288,7 @@ def test_dimensions_area_is_exact_decimal_product_not_float():
     assert body["strengths_mpa"] == [35.5, 35.5, 35.5]
 
     area_response = evaluate(
-        make_payload(30.0, [800, 800, 800], area="22545.02")
+        make_payload(30.0, [800, 800, 800], area=22545.02)
     )
     assert area_response.status_code == 200
     assert area_response.json() == body
@@ -372,121 +372,6 @@ def test_extreme_values_still_apply_release_criteria():
     assert body["reasons"] == ["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
 
 
-def test_extremely_large_dimensions_return_complete_verdict():
-    # 1e1000000 mm faces are legal (positive) but their product 1e2000000
-    # mm² overflows the default decimal context's exponent range (Emax
-    # 999999); the area conversion must stay exact and the batch must get a
-    # complete verdict instead of an internal error. 700 kN on a 1e2000000
-    # mm² face is effectively 0 MPa, so the batch fails on both criteria.
-    response = evaluate(
-        make_dimensions_payload(30.0, [700, 720, 710], width="1e1000000", depth="1e1000000")
-    )
-    assert response.status_code == 200
-    body = json.loads(response.text, parse_float=Decimal)
-    assert body["strengths_mpa"] == [Decimal("0.0"), Decimal("0.0"), Decimal("0.0")]
-    assert body["mean_strength_mpa"] == Decimal("0.0")
-    assert body["passed"] is False
-    assert body["reasons"] == ["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
-
-
-def test_dimensions_beyond_decimal_exponent_limit_return_complete_verdict():
-    # 1e999999999999999999 mm is the largest exponent a Decimal can hold;
-    # the exact face product exceeds even the implementation's exponent
-    # limit. The evaluation must still complete: an unrepresentably large
-    # area legitimately yields zero strengths and a failing verdict.
-    response = evaluate(
-        make_dimensions_payload(
-            30.0, [700, 720, 710],
-            width="1e999999999999999999", depth="1e999999999999999999",
-        )
-    )
-    assert response.status_code == 200
-    body = json.loads(response.text, parse_float=Decimal)
-    assert body["strengths_mpa"] == [Decimal("0.0"), Decimal("0.0"), Decimal("0.0")]
-    assert body["mean_strength_mpa"] == Decimal("0.0")
-    assert body["passed"] is False
-    assert body["reasons"] == ["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
-
-
-def test_extremely_small_dimensions_return_complete_verdict():
-    # 1e-1000000 mm faces are legal (positive) but their product
-    # 1e-2000000 mm² underflows the default decimal context's exponent
-    # range (Emin -999999) to zero, turning the strength computation into
-    # a division by zero; the verdict must still be computed exactly.
-    # 700_000 N / 1e-2000000 mm² = 7e2000005 MPa, quantized to 0.1 MPa.
-    response = evaluate(
-        make_dimensions_payload(30.0, [700, 720, 710], width="1e-1000000", depth="1e-1000000")
-    )
-    assert response.status_code == 200
-    body = json.loads(response.text, parse_float=Decimal)
-    assert body["strengths_mpa"] == [
-        Decimal("7" + "0" * 2000005 + ".0"),
-        Decimal("72" + "0" * 2000004 + ".0"),
-        Decimal("71" + "0" * 2000004 + ".0"),
-    ]
-    assert body["mean_strength_mpa"] == Decimal("71" + "0" * 2000004 + ".0")
-    assert body["passed"] is True
-    assert body["reasons"] == []
-
-
-def test_dimensions_at_decimal_lower_limit_return_complete_verdict():
-    # 1e-999999999999999999 mm is the smallest normal magnitude a Decimal
-    # can hold; the exact face product (1e-1999999999999999998 mm²) and
-    # the exact strengths exceed even the implementation's limits, so no
-    # Decimal can represent them. The evaluation must still complete:
-    # strengths saturate to +Infinity and the batch trivially passes.
-    response = evaluate(
-        make_dimensions_payload(
-            30.0, [700, 720, 710],
-            width="1e-999999999999999999", depth="1e-999999999999999999",
-        )
-    )
-    assert response.status_code == 200
-    body = response.json()  # Python's json parser maps Infinity to inf
-    assert body["strengths_mpa"] == [float("inf"), float("inf"), float("inf")]
-    assert body["mean_strength_mpa"] == float("inf")
-    assert body["passed"] is True
-    assert body["reasons"] == []
-
-
-def test_dimensions_at_decimal_subnormal_limit_return_complete_verdict():
-    # 1e-1999999999999999997 mm is the smallest positive Decimal of all
-    # (the subnormal quantum); the same saturation contract applies.
-    response = evaluate(
-        make_dimensions_payload(
-            30.0, [700, 720, 710],
-            width="1e-1999999999999999997", depth="1e-1999999999999999997",
-        )
-    )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["strengths_mpa"] == [float("inf"), float("inf"), float("inf")]
-    assert body["mean_strength_mpa"] == float("inf")
-    assert body["passed"] is True
-    assert body["reasons"] == []
-
-
-def test_saturated_specimen_does_not_corrupt_ordinary_siblings():
-    # A batch mixing one unrepresentably strong specimen with two ordinary
-    # ones: the ordinary strengths stay exact, the mean saturates, and the
-    # minimum-single-value check still sees the ordinary strengths.
-    payload = {
-        "design_strength_mpa": 30.0,
-        "specimens": [
-            {"width_mm": "1e-999999999999999999", "depth_mm": "1e-999999999999999999", "load_kn": 700},
-            {"area_mm2": 22500, "load_kn": 720},
-            {"area_mm2": 22500, "load_kn": 710},
-        ],
-    }
-    response = evaluate(payload)
-    assert response.status_code == 200
-    body = response.json()
-    assert body["strengths_mpa"] == [float("inf"), 32.0, 31.6]
-    assert body["mean_strength_mpa"] == float("inf")
-    assert body["passed"] is True
-    assert body["reasons"] == []
-
-
 def test_high_precision_calibration_factor_is_echoed_exactly():
     # 17 significant digits fit the 0.9500-1.0500 range but not a float64;
     # the applied factor must be echoed exactly, not collapsed to 1.0.
@@ -496,23 +381,6 @@ def test_high_precision_calibration_factor_is_echoed_exactly():
     assert response.status_code == 200
     body = json.loads(response.text, parse_float=Decimal)
     assert body["applied_calibration_factor"] == Decimal("1.0000000000000001")
-
-
-def test_high_precision_calibration_factor_is_applied_exactly():
-    # 707.62499999999999775 kN / 22500 mm² = 31.449999... MPa -> 31.4 MPa.
-    # Multiplying by 1.0000000000000001 first lifts the strength just past
-    # the 31.45 MPa rounding boundary -> 31.5 MPa.
-    uncalibrated = evaluate(make_payload(30.0, ["707.62499999999999775", 720, 720]))
-    assert uncalibrated.status_code == 200
-    assert uncalibrated.json()["strengths_mpa"] == [31.4, 32.0, 32.0]
-
-    payload = make_payload(30.0, ["707.62499999999999775", 720, 720])
-    payload["calibration_factor"] = "1.0000000000000001"
-    response = evaluate(payload)
-    assert response.status_code == 200
-    body = response.json()
-    assert body["strengths_mpa"] == [31.5, 32.0, 32.0]
-    assert body["mean_strength_mpa"] == 31.8
 
 
 INVALID_CALIBRATION_FACTORS = {
@@ -656,6 +524,89 @@ def test_invalid_payloads_return_422_without_partial_strengths(payload):
     assert "strengths_mpa" not in body
     assert "mean_strength_mpa" not in body
     assert "passed" not in body
+
+
+STRING_NUMERIC_CASES = {
+    # Defect scenarios: numeric strings where the contract requires JSON
+    # numbers must be rejected with a type error before any calculation.
+    "string_dimensions": (
+        {
+            "design_strength_mpa": 30.0,
+            "specimens": [
+                {"width_mm": "150", "depth_mm": "150", "load_kn": 800},
+                {"width_mm": "150", "depth_mm": "150", "load_kn": 800},
+                {"width_mm": "150", "depth_mm": "150", "load_kn": 500},
+            ],
+        },
+        {"width_mm", "depth_mm"},
+    ),
+    "string_loads_with_dimensions": (
+        {
+            "design_strength_mpa": 30.0,
+            "specimens": [
+                {"width_mm": 150, "depth_mm": 150, "load_kn": "800"},
+                {"width_mm": 150, "depth_mm": 150, "load_kn": "800"},
+                {"width_mm": 150, "depth_mm": 150, "load_kn": "500"},
+            ],
+        },
+        {"load_kn"},
+    ),
+    "string_areas": (
+        {
+            "design_strength_mpa": 30.0,
+            "specimens": [
+                {"area_mm2": "22500", "load_kn": 800},
+                {"area_mm2": "22500", "load_kn": 800},
+                {"area_mm2": "22500", "load_kn": 500},
+            ],
+        },
+        {"area_mm2"},
+    ),
+    "string_loads_with_area": (
+        {
+            "design_strength_mpa": 30.0,
+            "specimens": [
+                {"area_mm2": 22500, "load_kn": "800"},
+                {"area_mm2": 22500, "load_kn": "800"},
+                {"area_mm2": 22500, "load_kn": "500"},
+            ],
+        },
+        {"load_kn"},
+    ),
+    "single_string_dimension_among_numbers": (
+        {
+            "design_strength_mpa": 30.0,
+            "specimens": [
+                {"width_mm": 150, "depth_mm": "150", "load_kn": 700},
+                {"area_mm2": 22500, "load_kn": 700},
+                {"area_mm2": 22500, "load_kn": 710},
+            ],
+        },
+        {"depth_mm"},
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "payload,pointed_fields",
+    STRING_NUMERIC_CASES.values(),
+    ids=STRING_NUMERIC_CASES.keys(),
+)
+def test_numeric_strings_are_rejected_with_type_error(payload, pointed_fields):
+    # Specimen numerics are contractually JSON numbers: "150"-style
+    # strings must fail with 422 before any calculation, with the error
+    # location pointing at the offending field.
+    response = evaluate(payload)
+    assert response.status_code == 422
+    body = response.json()
+    assert "strengths_mpa" not in body
+    assert "mean_strength_mpa" not in body
+    assert "passed" not in body
+    locations = [tuple(error["loc"]) for error in body["detail"]]
+    for field in pointed_fields:
+        assert any(
+            "specimens" in loc and loc[-1] == field for loc in locations
+        ), locations
 
 
 @pytest.mark.parametrize(
