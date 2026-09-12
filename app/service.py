@@ -8,13 +8,23 @@ An optional press calibration factor scales each specimen's load before
 the strength rounding; the calibrated load itself is never rounded.
 """
 
-from decimal import MAX_EMAX, ROUND_HALF_UP, Decimal, DefaultContext, localcontext
+from decimal import (
+    MAX_EMAX,
+    MAX_PREC,
+    ROUND_HALF_UP,
+    Decimal,
+    DefaultContext,
+    DivisionByZero,
+    Overflow,
+    localcontext,
+)
 from typing import NamedTuple, Sequence
 
 MPA_RESOLUTION = Decimal("0.1")
 MIN_SINGLE_RATIO = Decimal("0.85")
 NO_CALIBRATION = Decimal("1")
 DEFAULT_PRECISION = DefaultContext.prec
+POSITIVE_INFINITY = Decimal("Infinity")
 
 REASON_MEAN_BELOW_DESIGN = "MEAN_BELOW_DESIGN"
 REASON_MIN_BELOW_85_PERCENT = "MIN_BELOW_85_PERCENT"
@@ -42,7 +52,11 @@ def round_to_tenth(value: Decimal) -> Decimal:
     The exponent range is likewise widened from the default ±999999 to the
     implementation's hard limits, so extreme-but-representable strengths
     (e.g. from 1e-1000000 mm² faces) quantize instead of overflowing.
+    Non-finite values (strengths saturated beyond the exponent limit) have
+    nothing to round and pass through unchanged.
     """
+    if not value.is_finite():
+        return value
     with localcontext() as ctx:
         ctx.prec = max(ctx.prec, value.adjusted() + 2)
         ctx.Emax = MAX_EMAX
@@ -51,8 +65,44 @@ def round_to_tenth(value: Decimal) -> Decimal:
 
 
 def specimen_strength_mpa(load_kn: Decimal, area_mm2: Decimal) -> Decimal:
-    """Single specimen strength: load_kn * 1000 / area_mm2, rounded to 0.1 MPa."""
-    return round_to_tenth(load_kn * 1000 / area_mm2)
+    """Single specimen strength: load_kn * 1000 / area_mm2, rounded to 0.1 MPa.
+
+    When the exact strength's exponent exceeds the decimal
+    implementation's hard limit (e.g. a 700 kN load on a
+    1e-999999999999999999 mm x 1e-999999999999999999 mm face), no Decimal
+    can represent it; the strength saturates to +Infinity — every input
+    is positive, so the quotient can only grow without bound — and the
+    batch still produces a complete verdict. The division itself runs
+    with Overflow and DivisionByZero untrapped for the same reason: a
+    zero effective area can only arise from an unrepresentably tiny
+    width x depth product, and a boundary quotient can only overflow
+    upwards. Precision is sized per specimen so one extreme specimen
+    cannot inflate (or exhaust) the precision of its ordinary siblings.
+    """
+    if (
+        load_kn.is_finite()
+        and area_mm2.is_finite()
+        and load_kn.adjusted() + 3 - area_mm2.adjusted() > MAX_EMAX + 1
+    ):
+        return POSITIVE_INFINITY
+    with localcontext() as ctx:
+        ctx.prec = min(
+            max(
+                DEFAULT_PRECISION,
+                load_kn.adjusted()
+                + 3
+                - area_mm2.adjusted()
+                + len(load_kn.as_tuple().digits)
+                + len(area_mm2.as_tuple().digits)
+                + 10,
+            ),
+            MAX_PREC,
+        )
+        ctx.Emax = MAX_EMAX
+        ctx.Emin = -MAX_EMAX
+        ctx.traps[Overflow] = False
+        ctx.traps[DivisionByZero] = False
+        return round_to_tenth(load_kn * 1000 / area_mm2)
 
 
 def _required_precision(
@@ -104,10 +154,14 @@ def evaluate_batch(
         # default context caps exponents at ±999999, so strengths from
         # 1e-1000000 mm² faces or 1e1000000 mm² areas would overflow or
         # underflow mid-calculation. Widen the exponent range to the
-        # implementation's hard limits as well.
-        ctx.prec = precision
+        # implementation's hard limits as well, cap precision at what the
+        # implementation supports, and let the calibration multiplication
+        # saturate to +Infinity rather than raise when no Decimal can
+        # hold the calibrated load.
+        ctx.prec = min(precision, MAX_PREC)
         ctx.Emax = MAX_EMAX
         ctx.Emin = -MAX_EMAX
+        ctx.traps[Overflow] = False
         strengths = tuple(
             specimen_strength_mpa(s.load_kn * calibration_factor, s.area_mm2)
             for s in specimens

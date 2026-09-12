@@ -429,6 +429,64 @@ def test_extremely_small_dimensions_return_complete_verdict():
     assert body["reasons"] == []
 
 
+def test_dimensions_at_decimal_lower_limit_return_complete_verdict():
+    # 1e-999999999999999999 mm is the smallest normal magnitude a Decimal
+    # can hold; the exact face product (1e-1999999999999999998 mm²) and
+    # the exact strengths exceed even the implementation's limits, so no
+    # Decimal can represent them. The evaluation must still complete:
+    # strengths saturate to +Infinity and the batch trivially passes.
+    response = evaluate(
+        make_dimensions_payload(
+            30.0, [700, 720, 710],
+            width="1e-999999999999999999", depth="1e-999999999999999999",
+        )
+    )
+    assert response.status_code == 200
+    body = response.json()  # Python's json parser maps Infinity to inf
+    assert body["strengths_mpa"] == [float("inf"), float("inf"), float("inf")]
+    assert body["mean_strength_mpa"] == float("inf")
+    assert body["passed"] is True
+    assert body["reasons"] == []
+
+
+def test_dimensions_at_decimal_subnormal_limit_return_complete_verdict():
+    # 1e-1999999999999999997 mm is the smallest positive Decimal of all
+    # (the subnormal quantum); the same saturation contract applies.
+    response = evaluate(
+        make_dimensions_payload(
+            30.0, [700, 720, 710],
+            width="1e-1999999999999999997", depth="1e-1999999999999999997",
+        )
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [float("inf"), float("inf"), float("inf")]
+    assert body["mean_strength_mpa"] == float("inf")
+    assert body["passed"] is True
+    assert body["reasons"] == []
+
+
+def test_saturated_specimen_does_not_corrupt_ordinary_siblings():
+    # A batch mixing one unrepresentably strong specimen with two ordinary
+    # ones: the ordinary strengths stay exact, the mean saturates, and the
+    # minimum-single-value check still sees the ordinary strengths.
+    payload = {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"width_mm": "1e-999999999999999999", "depth_mm": "1e-999999999999999999", "load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 720},
+            {"area_mm2": 22500, "load_kn": 710},
+        ],
+    }
+    response = evaluate(payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strengths_mpa"] == [float("inf"), 32.0, 31.6]
+    assert body["mean_strength_mpa"] == float("inf")
+    assert body["passed"] is True
+    assert body["reasons"] == []
+
+
 def test_high_precision_calibration_factor_is_echoed_exactly():
     # 17 significant digits fit the 0.9500-1.0500 range but not a float64;
     # the applied factor must be echoed exactly, not collapsed to 1.0.

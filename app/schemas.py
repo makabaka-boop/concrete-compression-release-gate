@@ -1,7 +1,7 @@
 """Request/response contracts for the batch strength evaluation API."""
 
 import re
-from decimal import MAX_EMAX, Decimal, DefaultContext, Overflow, localcontext
+from decimal import MAX_EMAX, MAX_PREC, Decimal, Overflow, localcontext
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -18,8 +18,14 @@ ReasonCode = Literal["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
 # Response Decimals are rendered as JSON numbers on the wire (see
 # main.ExactDecimalJSONResponse); keep the documented contract as "number"
 # even though pydantic's default serialization schema for Decimal is
-# "string".
-JsonNumber = Annotated[Decimal, WithJsonSchema({"type": "number"}, mode="serialization")]
+# "string". Non-finite values are allowed: a strength whose exact value no
+# Decimal can represent saturates to +Infinity so the verdict stays
+# complete.
+JsonNumber = Annotated[
+    Decimal,
+    Field(allow_inf_nan=True),
+    WithJsonSchema({"type": "number"}, mode="serialization"),
+]
 
 # evaluation_id is an opaque client-supplied idempotency key. It must be
 # non-blank when present (an empty id would silently share one ledger slot
@@ -39,14 +45,17 @@ def _exact_decimal_product(left: Decimal, right: Decimal) -> Decimal:
     e.g. a 1e1000000 mm face — before it ever reaches the evaluation,
     silently changing the area or turning the request into a 500. Widen
     precision and exponent range to the decimal implementation's hard
-    limits so the converted area is the exact product. A product beyond
-    even those limits saturates to +Infinity instead of raising, so the
-    batch still evaluates (an unrepresentably large area legitimately
-    yields zero strengths).
+    limits so the converted area is the exact product whenever that
+    product is representable at all (multiplication cost scales with the
+    operands' digits, not the precision cap). A product beyond even those
+    limits saturates — +Infinity on overflow, 0 on underflow — instead of
+    raising, so the batch still evaluates: an unrepresentably large area
+    legitimately yields zero strengths, an unrepresentably small one
+    yields unbounded strengths.
     """
     with localcontext() as ctx:
         required_prec = len(left.as_tuple().digits) + len(right.as_tuple().digits)
-        ctx.prec = max(DefaultContext.prec, required_prec)
+        ctx.prec = max(MAX_PREC, required_prec)
         ctx.Emax = MAX_EMAX
         ctx.Emin = -MAX_EMAX
         ctx.traps[Overflow] = False

@@ -24,7 +24,10 @@ def _dumps_exact(value: Any) -> str:
     str() of a finite Decimal is always a valid JSON number (plain or
     exponent notation) and preserves every significant digit, unlike
     pydantic's JSON mode (stringifies Decimal) or jsonable_encoder
-    (truncates Decimal to float64).
+    (truncates Decimal to float64). A non-finite Decimal — a strength
+    saturated to +Infinity because no Decimal can represent it — is
+    emitted as the ``Infinity`` literal, which Python's json parser
+    accepts and maps to float inf.
     """
     if value is None:
         return "null"
