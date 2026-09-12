@@ -372,6 +372,63 @@ def test_extreme_values_still_apply_release_criteria():
     assert body["reasons"] == ["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
 
 
+def test_extremely_large_dimensions_return_complete_verdict():
+    # 1e1000000 mm faces are legal (positive) but their product 1e2000000
+    # mm² overflows the default decimal context's exponent range (Emax
+    # 999999); the area conversion must stay exact and the batch must get a
+    # complete verdict instead of an internal error. 700 kN on a 1e2000000
+    # mm² face is effectively 0 MPa, so the batch fails on both criteria.
+    response = evaluate(
+        make_dimensions_payload(30.0, [700, 720, 710], width="1e1000000", depth="1e1000000")
+    )
+    assert response.status_code == 200
+    body = json.loads(response.text, parse_float=Decimal)
+    assert body["strengths_mpa"] == [Decimal("0.0"), Decimal("0.0"), Decimal("0.0")]
+    assert body["mean_strength_mpa"] == Decimal("0.0")
+    assert body["passed"] is False
+    assert body["reasons"] == ["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
+
+
+def test_dimensions_beyond_decimal_exponent_limit_return_complete_verdict():
+    # 1e999999999999999999 mm is the largest exponent a Decimal can hold;
+    # the exact face product exceeds even the implementation's exponent
+    # limit. The evaluation must still complete: an unrepresentably large
+    # area legitimately yields zero strengths and a failing verdict.
+    response = evaluate(
+        make_dimensions_payload(
+            30.0, [700, 720, 710],
+            width="1e999999999999999999", depth="1e999999999999999999",
+        )
+    )
+    assert response.status_code == 200
+    body = json.loads(response.text, parse_float=Decimal)
+    assert body["strengths_mpa"] == [Decimal("0.0"), Decimal("0.0"), Decimal("0.0")]
+    assert body["mean_strength_mpa"] == Decimal("0.0")
+    assert body["passed"] is False
+    assert body["reasons"] == ["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
+
+
+def test_extremely_small_dimensions_return_complete_verdict():
+    # 1e-1000000 mm faces are legal (positive) but their product
+    # 1e-2000000 mm² underflows the default decimal context's exponent
+    # range (Emin -999999) to zero, turning the strength computation into
+    # a division by zero; the verdict must still be computed exactly.
+    # 700_000 N / 1e-2000000 mm² = 7e2000005 MPa, quantized to 0.1 MPa.
+    response = evaluate(
+        make_dimensions_payload(30.0, [700, 720, 710], width="1e-1000000", depth="1e-1000000")
+    )
+    assert response.status_code == 200
+    body = json.loads(response.text, parse_float=Decimal)
+    assert body["strengths_mpa"] == [
+        Decimal("7" + "0" * 2000005 + ".0"),
+        Decimal("72" + "0" * 2000004 + ".0"),
+        Decimal("71" + "0" * 2000004 + ".0"),
+    ]
+    assert body["mean_strength_mpa"] == Decimal("71" + "0" * 2000004 + ".0")
+    assert body["passed"] is True
+    assert body["reasons"] == []
+
+
 def test_high_precision_calibration_factor_is_echoed_exactly():
     # 17 significant digits fit the 0.9500-1.0500 range but not a float64;
     # the applied factor must be echoed exactly, not collapsed to 1.0.
@@ -575,6 +632,37 @@ def test_invalid_dimensions_422_loc_points_at_specimen_and_field(
         and loc[-1] == pointed_field
         for loc in locations
     ), locations
+
+
+def test_zero_width_and_missing_depth_report_both_errors():
+    # The first specimen has a non-positive width AND lacks depth_mm: the
+    # 422 must flag the width field constraint *and* the missing paired
+    # dimension, not hide the expression error behind the field error.
+    payload = {
+        "design_strength_mpa": 30.0,
+        "specimens": [
+            {"width_mm": 0, "load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 700},
+            {"area_mm2": 22500, "load_kn": 710},
+        ],
+    }
+    response = evaluate(payload)
+    assert response.status_code == 422
+    body = response.json()
+    assert "strengths_mpa" not in body
+    assert "mean_strength_mpa" not in body
+    assert "passed" not in body
+    locations = [tuple(error["loc"]) for error in body["detail"]]
+    assert any(
+        "specimens" in loc and 0 in loc and loc[-1] == "width_mm" for loc in locations
+    ), locations
+    assert any(
+        "specimens" in loc and 0 in loc and loc[-1] == "depth_mm" for loc in locations
+    ), locations
+    depth_errors = [
+        error for error in body["detail"] if tuple(error["loc"])[-1] == "depth_mm"
+    ]
+    assert depth_errors[0]["type"] == "missing_loaded_face_dimension"
 
 
 def test_non_finite_number_returns_422_not_internal_error():

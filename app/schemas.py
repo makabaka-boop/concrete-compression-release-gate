@@ -1,8 +1,8 @@
 """Request/response contracts for the batch strength evaluation API."""
 
 import re
-from decimal import Decimal, DefaultContext, localcontext
-from typing import Annotated, Literal
+from decimal import MAX_EMAX, Decimal, DefaultContext, Overflow, localcontext
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -11,7 +11,7 @@ from pydantic import (
     WithJsonSchema,
     model_validator,
 )
-from pydantic_core import PydanticCustomError
+from pydantic_core import InitErrorDetails, PydanticCustomError
 
 ReasonCode = Literal["MEAN_BELOW_DESIGN", "MIN_BELOW_85_PERCENT"]
 
@@ -31,17 +31,78 @@ EvaluationId = Annotated[
 
 
 def _exact_decimal_product(left: Decimal, right: Decimal) -> Decimal:
-    """Multiply two Decimals without context-precision rounding.
+    """Multiply two Decimals without context-precision or exponent-range
+    rounding.
 
-    The default 28-digit context would round the product of long
-    measurements (e.g. high-precision ``width_mm``/``depth_mm`` readings)
-    before it ever reaches the evaluation, silently changing the area;
-    widen the context so the converted area is the exact product.
+    The default context (28 digits, exponents within ±999999) would round
+    the product of long measurements — or reject extreme-but-legal ones,
+    e.g. a 1e1000000 mm face — before it ever reaches the evaluation,
+    silently changing the area or turning the request into a 500. Widen
+    precision and exponent range to the decimal implementation's hard
+    limits so the converted area is the exact product. A product beyond
+    even those limits saturates to +Infinity instead of raising, so the
+    batch still evaluates (an unrepresentably large area legitimately
+    yields zero strengths).
     """
     with localcontext() as ctx:
         required_prec = len(left.as_tuple().digits) + len(right.as_tuple().digits)
         ctx.prec = max(DefaultContext.prec, required_prec)
+        ctx.Emax = MAX_EMAX
+        ctx.Emin = -MAX_EMAX
+        ctx.traps[Overflow] = False
         return left * right
+
+
+def _loaded_face_expression_errors(
+    has_area: bool,
+    has_width: bool,
+    has_depth: bool,
+    area_input: Any,
+) -> list[InitErrorDetails]:
+    """Contract errors for the loaded-face expression, if any.
+
+    Exactly one of ``area_mm2`` or the ``width_mm``/``depth_mm`` pair must
+    be present; mixing forms, giving only one dimension, or giving neither
+    is a contract violation. Error locations follow the contract: a
+    missing paired side points at the missing dimension, mixing or no
+    expression at all points at ``area_mm2``.
+    """
+    if has_area and (has_width or has_depth):
+        return [
+            {
+                "type": PydanticCustomError(
+                    "mixed_area_and_dimensions",
+                    "area_mm2 与 width_mm/depth_mm 不能混用，受压面只能选择其中一种表达方式",
+                ),
+                "loc": ("area_mm2",),
+                "input": area_input,
+            }
+        ]
+    if not has_area and (has_width != has_depth):
+        missing_field = "depth_mm" if has_width else "width_mm"
+        return [
+            {
+                "type": PydanticCustomError(
+                    "missing_loaded_face_dimension",
+                    "width_mm 与 depth_mm 必须成对提供受压面尺寸，缺少 {missing_field}",
+                    {"missing_field": missing_field},
+                ),
+                "loc": (missing_field,),
+                "input": None,
+            }
+        ]
+    if not has_area and not has_width and not has_depth:
+        return [
+            {
+                "type": PydanticCustomError(
+                    "missing_loaded_face",
+                    "必须提供 area_mm2，或成对提供 width_mm 与 depth_mm",
+                ),
+                "loc": ("area_mm2",),
+                "input": None,
+            }
+        ]
+    return []
 
 
 class Specimen(BaseModel):
@@ -74,42 +135,50 @@ class Specimen(BaseModel):
     )
     load_kn: Decimal = Field(gt=0, description="破坏载荷，单位 kN，必须大于 0")
 
-    @model_validator(mode="after")
-    def _validate_loaded_face_expression(self) -> "Specimen":
-        has_area = self.area_mm2 is not None
-        has_width = self.width_mm is not None
-        has_depth = self.depth_mm is not None
+    @model_validator(mode="wrap")
+    @classmethod
+    def _validate_loaded_face_expression(
+        cls, values: Any, handler: Any
+    ) -> "Specimen":
+        """Enforce the loaded-face contract alongside field constraints.
 
-        if has_area and (has_width or has_depth):
-            error = PydanticCustomError(
-                "mixed_area_and_dimensions",
-                "area_mm2 与 width_mm/depth_mm 不能混用，受压面只能选择其中一种表达方式",
+        Field checks (e.g. ``width_mm > 0``) run inside ``handler``; the
+        face-expression rules are applied here so that a specimen breaking
+        both reports both problems — e.g. a zero width together with a
+        missing depth flags the non-positive ``width_mm`` *and* the
+        missing ``depth_mm``, instead of hiding the expression error
+        behind the failed field check.
+        """
+        try:
+            model = handler(values)
+        except ValidationError as exc:
+            # Field validation failed; the expression contract still
+            # applies to the raw input, so merge its errors with the
+            # field errors instead of dropping them.
+            expression_errors = (
+                _loaded_face_expression_errors(
+                    values.get("area_mm2") is not None,
+                    values.get("width_mm") is not None,
+                    values.get("depth_mm") is not None,
+                    values.get("area_mm2"),
+                )
+                if isinstance(values, dict)
+                else []
             )
-            raise ValidationError.from_exception_data(
-                type(self).__name__,
-                [{"type": error, "loc": ("area_mm2",), "input": self.area_mm2}],
-            )
-        if not has_area and (has_width != has_depth):
-            missing_field = "depth_mm" if has_width else "width_mm"
-            error = PydanticCustomError(
-                "missing_loaded_face_dimension",
-                "width_mm 与 depth_mm 必须成对提供受压面尺寸，缺少 {missing_field}",
-                {"missing_field": missing_field},
-            )
-            raise ValidationError.from_exception_data(
-                type(self).__name__,
-                [{"type": error, "loc": (missing_field,), "input": None}],
-            )
-        if not has_area and not has_width and not has_depth:
-            error = PydanticCustomError(
-                "missing_loaded_face",
-                "必须提供 area_mm2，或成对提供 width_mm 与 depth_mm",
-            )
-            raise ValidationError.from_exception_data(
-                type(self).__name__,
-                [{"type": error, "loc": ("area_mm2",), "input": None}],
-            )
-        return self
+            if expression_errors:
+                raise ValidationError.from_exception_data(
+                    cls.__name__, [*exc.errors(), *expression_errors]
+                ) from None
+            raise
+        expression_errors = _loaded_face_expression_errors(
+            model.area_mm2 is not None,
+            model.width_mm is not None,
+            model.depth_mm is not None,
+            model.area_mm2,
+        )
+        if expression_errors:
+            raise ValidationError.from_exception_data(cls.__name__, expression_errors)
+        return model
 
     @property
     def effective_area_mm2(self) -> Decimal:

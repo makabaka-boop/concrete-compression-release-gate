@@ -8,7 +8,7 @@ An optional press calibration factor scales each specimen's load before
 the strength rounding; the calibrated load itself is never rounded.
 """
 
-from decimal import ROUND_HALF_UP, Decimal, DefaultContext, localcontext
+from decimal import MAX_EMAX, ROUND_HALF_UP, Decimal, DefaultContext, localcontext
 from typing import NamedTuple, Sequence
 
 MPA_RESOLUTION = Decimal("0.1")
@@ -39,9 +39,14 @@ def round_to_tenth(value: Decimal) -> Decimal:
     significant digits than the context precision (default 28) provides —
     e.g. strengths from extremely large loads or tiny areas. Widen the
     precision to the value's magnitude so any finite value rounds cleanly.
+    The exponent range is likewise widened from the default ±999999 to the
+    implementation's hard limits, so extreme-but-representable strengths
+    (e.g. from 1e-1000000 mm² faces) quantize instead of overflowing.
     """
     with localcontext() as ctx:
         ctx.prec = max(ctx.prec, value.adjusted() + 2)
+        ctx.Emax = MAX_EMAX
+        ctx.Emin = -MAX_EMAX
         return value.quantize(MPA_RESOLUTION, rounding=ROUND_HALF_UP)
 
 
@@ -94,7 +99,15 @@ def evaluate_batch(
     MIN_BELOW_85_PERCENT.
     """
     precision = _required_precision(design_strength_mpa, specimens, calibration_factor)
-    with localcontext(prec=precision):
+    with localcontext() as ctx:
+        # Precision alone is not enough for extreme-but-legal inputs: the
+        # default context caps exponents at ±999999, so strengths from
+        # 1e-1000000 mm² faces or 1e1000000 mm² areas would overflow or
+        # underflow mid-calculation. Widen the exponent range to the
+        # implementation's hard limits as well.
+        ctx.prec = precision
+        ctx.Emax = MAX_EMAX
+        ctx.Emin = -MAX_EMAX
         strengths = tuple(
             specimen_strength_mpa(s.load_kn * calibration_factor, s.area_mm2)
             for s in specimens
