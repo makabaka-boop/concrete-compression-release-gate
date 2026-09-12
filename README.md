@@ -130,7 +130,7 @@ curl -X POST http://localhost:8000/evaluate \
 实验室网络重试可能让同一组试件被重复裁决。请求携带 `evaluation_id` 时，接口按以下规则去重并留痕：
 
 1. **请求指纹**：以归一化后的设计强度、三块试件（**有效面积**、载荷，含顺序）与校准系数生成指纹。请求进入裁决前，`width_mm × depth_mm` 已按 `Decimal` 精确乘积换算为有效面积，因此用面积或等价尺寸录入同一受压面产生相同指纹——尺寸首录后可用等价面积回放，反之亦然，不会误报冲突。数值按 `Decimal` 值规范化——`30.0`、`30.00`、`3E+1` 等值不同形，视为同一请求；但显式 `calibration_factor: 1.0` 与省略系数不同（前者响应多 `applied_calibration_factor` 字段）。
-2. **首次提交**：调用原有 Decimal 裁决服务计算，将 `evaluation_id`、指纹与完整结果写入本地 SQLite 台账，返回结果并带 `replayed: false`。
+2. **首次提交**：调用原有 Decimal 裁决服务计算，将 `evaluation_id`、指纹、完整结果与**请求快照**（规范化后的设计强度、三块试件的有效面积与载荷、校准系数及提交方式）写入本地 SQLite 台账，返回结果并带 `replayed: false`。快照供 `GET /evaluations/{evaluation_id}` 复核查询。
 3. **相同重试**：`evaluation_id` 与业务输入均与首次一致时，不重新计算，直接返回首次保存的结果并带 `replayed: true`。
 4. **标识冲突**：`evaluation_id` 已对应不同业务输入时返回 `409 Conflict`，错误体指出 `evaluation_id` 冲突，**已保存的首次结果不被覆盖**。
 5. **非法请求**：试件（含尺寸缺项、面积/尺寸混用、非正尺寸）或校准系数非法时仍返回 `422`，且在写入台账之前——不会留下占位记录，同一标识修正尺寸后可正常首次提交。
@@ -154,13 +154,52 @@ curl -X POST http://localhost:8000/evaluate \
 
 首次响应 `200 OK`：`{"strengths_mpa":[31.1,32.0,31.6],"mean_strength_mpa":31.6,"passed":true,"reasons":[],"replayed":false}`；相同请求重试时同一结果带 `"replayed":true`。重试时也可把任一试件的 `area_mm2` 换成数值等价的 `width_mm`/`depth_mm`（例如 22500 ↔ 150 × 150），归一化后指纹一致，仍回放首次结果。
 
+### `GET /evaluations/{evaluation_id}`
+
+复核查询：按幂等标识调出台账中的首次裁决与当时输入，无需依赖调用方缓存。
+
+- 首次写入时，台账在保存裁决结果的同时保存**请求快照**：规范化的设计强度、三块试件的有效受压面积（`width_mm × depth_mm` 已换算为 `area_mm2`）与破坏载荷、校准系数及其提交方式（`calibration_explicit` 表示调用方是否显式提交，未提交时系数按 1 记录）。重复提交只回放原结果，不改写记录时间与快照。
+- 命中时返回 `200 OK`：`evaluation_id`、`created_at`（首次落库时间）、`snapshot_available`、快照字段（`design_strength_mpa`、`specimens`、`calibration_factor`、`calibration_explicit`）以及 `result`（首次裁决结果，不含 `replayed` 标记）。数值字段与裁决链路同样按精确 Decimal 输出。
+- 启动时服务以兼容迁移为旧库补齐 `request_snapshot` 列。迁移前写入的旧记录仍可查询标识、记录时间与裁决结果，但以 `"snapshot_available": false` 表明当时输入不可还原，响应中不出现快照字段。
+- 标识未知（包括从未落库的无标识请求）时返回 `404`，不伪造空记录。
+
+示例（上节携带标识的请求首次提交后）：
+
+```bash
+curl http://localhost:8000/evaluations/batch-2026-09-11-017
+```
+
+响应 `200 OK`：
+
+```json
+{
+  "evaluation_id": "batch-2026-09-11-017",
+  "created_at": "2026-09-11T08:15:30.123Z",
+  "snapshot_available": true,
+  "design_strength_mpa": 30.0,
+  "specimens": [
+    {"area_mm2": 22500, "load_kn": 700},
+    {"area_mm2": 22500, "load_kn": 720},
+    {"area_mm2": 22500, "load_kn": 710}
+  ],
+  "calibration_factor": 1,
+  "calibration_explicit": false,
+  "result": {
+    "strengths_mpa": [31.1, 32.0, 31.6],
+    "mean_strength_mpa": 31.6,
+    "passed": true,
+    "reasons": []
+  }
+}
+```
+
 ### `GET /health`
 
 返回 `{"status": "ok"}`，用于容器健康检查。
 
 ## 持久化与测试隔离
 
-台账为本地 SQLite 数据库，路径由环境变量 **`EVALUATION_DB_PATH`** 决定，默认 **`./data/evaluations.db`**（相对应用工作目录；compose 中固定为 `/srv/app/data/evaluations.db` 并挂载命名卷 `ledger`，记录跨容器重建保留）。运行中还会出现同目录的 `*.db-wal` / `*.db-shm` 伴生文件（WAL 模式），属正常现象。删除数据库文件即清空全部台账记录。
+台账为本地 SQLite 数据库，路径由环境变量 **`EVALUATION_DB_PATH`** 决定，默认 **`./data/evaluations.db`**（相对应用工作目录；compose 中固定为 `/srv/app/data/evaluations.db` 并挂载命名卷 `ledger`，记录跨容器重建保留）。运行中还会出现同目录的 `*.db-wal` / `*.db-shm` 伴生文件（WAL 模式），属正常现象。删除数据库文件即清空全部台账记录。服务启动时自动建表并执行兼容迁移：为快照功能之前写入的旧库补齐 `request_snapshot` 列，旧记录保持可查询（快照字段以 `snapshot_available=false` 标示不可还原）。
 
 测试隔离方式：`tests/` 下所有幂等用例均为每个请求生成 uuid 随机 `evaluation_id`，不与台账中既有记录互相影响，可对着同一数据库反复运行；如需彻底隔离的台账，启动服务时将 `EVALUATION_DB_PATH` 指向临时文件即可，例如：
 
@@ -193,13 +232,14 @@ API_BASE_URL=http://localhost:8000 pytest tests/ -v
 
 ```
 app/
-  main.py      # FastAPI 入口，POST /evaluate 与 GET /health
-  schemas.py   # Pydantic 请求/响应契约（正数校验、恰好三个试件、受压面面积/尺寸二选一、试件数值严格 JSON 数字类型、可选校准系数、可选幂等标识）
+  main.py      # FastAPI 入口，POST /evaluate、GET /evaluations/{evaluation_id} 与 GET /health
+  schemas.py   # Pydantic 请求/响应契约（正数校验、恰好三个试件、受压面面积/尺寸二选一、试件数值严格 JSON 数字类型、可选校准系数、可选幂等标识、台账记录查询响应）
   service.py   # Decimal 强度计算与批次放行裁决
-  store.py     # SQLite 幂等台账：请求指纹、记录查询与写入
+  store.py     # SQLite 幂等台账：请求指纹、请求快照、记录查询与写入、启动兼容迁移
 tests/
   test_api.py             # 通过真实 HTTP 验证计算与契约的 pytest 用例
   test_idempotency.py     # 通过真实 HTTP 验证幂等回放、冲突与隔离的 pytest 用例
+  test_retrieval.py       # 通过真实 HTTP 验证复核查询、重启后内容不变与旧表迁移可读的 pytest 用例
   test_service_extremes.py  # 极端量级场景的 Decimal 服务层单元测试（该量级无法以 JSON 数字经 HTTP 表达）
 Dockerfile     # python:3.12-slim 镜像
 compose.yaml   # api 服务（API_PORT 可覆盖，ledger 卷保存台账）+ verify 一次性服务

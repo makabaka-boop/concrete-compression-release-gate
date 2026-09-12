@@ -2,6 +2,7 @@
 
 import json
 import math
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Any
 
@@ -9,13 +10,29 @@ from fastapi import FastAPI, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from starlette.status import HTTP_409_CONFLICT, HTTP_422_UNPROCESSABLE_ENTITY
+from starlette.status import (
+    HTTP_404_NOT_FOUND,
+    HTTP_409_CONFLICT,
+    HTTP_422_UNPROCESSABLE_ENTITY,
+)
 
 from . import store
-from .schemas import EvaluationRequest, EvaluationResponse
+from .schemas import EvaluationRecordResponse, EvaluationRequest, EvaluationResponse
 from .service import SpecimenInput, evaluate_batch
 
-app = FastAPI(title="Concrete Batch Strength Evaluation", version="1.0.0")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Create the ledger schema and apply compatible migrations (e.g. the
+    # request_snapshot column on pre-snapshot databases) before the first
+    # request arrives.
+    store.init_db()
+    yield
+
+
+app = FastAPI(
+    title="Concrete Batch Strength Evaluation", version="1.0.0", lifespan=_lifespan
+)
 
 
 def _dumps_exact(value: Any) -> str:
@@ -135,10 +152,24 @@ def evaluate(request: EvaluationRequest) -> Response:
     record = store.lookup(request.evaluation_id)
     replayed = record is not None
     if record is None:
-        # First sight of this id: persist the verdict. A racing request may
-        # win the insert; the stored record always stands.
+        # First sight of this id: persist the verdict together with a
+        # snapshot of the normalized input, so the record stays auditable
+        # without trusting any caller-side cache. A racing request may win
+        # the insert; the stored record always stands.
+        snapshot = _dumps_exact(
+            {
+                "design_strength_mpa": request.design_strength_mpa,
+                "specimens": [
+                    {"area_mm2": specimen.area_mm2, "load_kn": specimen.load_kn}
+                    for specimen in effective_specimens
+                ],
+                "calibration_factor": request.calibration_factor,
+                "calibration_explicit": "calibration_factor"
+                in request.model_fields_set,
+            }
+        )
         record, inserted = store.store_if_absent(
-            request.evaluation_id, fingerprint, _dumps_exact(body)
+            request.evaluation_id, fingerprint, _dumps_exact(body), snapshot
         )
         replayed = not inserted
 
@@ -162,3 +193,39 @@ def evaluate(request: EvaluationRequest) -> Response:
     stored_body = json.loads(record.response_json, parse_float=Decimal)
     stored_body["replayed"] = replayed
     return ExactDecimalJSONResponse(stored_body)
+
+
+@app.get(
+    "/evaluations/{evaluation_id}",
+    response_model=EvaluationRecordResponse,
+    response_model_exclude_none=True,
+)
+def get_evaluation(evaluation_id: str) -> Response:
+    """Return the ledger record for one evaluation_id: first verdict plus,
+    when a request snapshot exists, the normalized input that produced it.
+    """
+    record = store.lookup(evaluation_id)
+    if record is None:
+        # Unknown id (or a request that never carried one and was therefore
+        # never persisted): no record is fabricated.
+        return JSONResponse(
+            status_code=HTTP_404_NOT_FOUND,
+            content={
+                "detail": "evaluation_id 不存在：台账中没有该标识的首次裁决记录",
+                "evaluation_id": evaluation_id,
+            },
+        )
+    body: dict[str, Any] = {
+        "evaluation_id": evaluation_id,
+        "created_at": record.created_at,
+        "snapshot_available": record.request_snapshot is not None,
+    }
+    if record.request_snapshot is not None:
+        # The snapshot is the normalized first input (design strength,
+        # effective area + load per specimen, calibration factor and its
+        # submission mode); merge its keys next to the record metadata.
+        body.update(json.loads(record.request_snapshot, parse_float=Decimal))
+    # The first verdict exactly as originally computed; parse_float=Decimal
+    # keeps every significant digit, same as the replay path.
+    body["result"] = json.loads(record.response_json, parse_float=Decimal)
+    return ExactDecimalJSONResponse(body)

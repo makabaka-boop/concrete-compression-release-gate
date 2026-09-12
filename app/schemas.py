@@ -273,3 +273,47 @@ class EvaluationResponse(BaseModel):
         default=None,
         description="是否回放了已保存的首次结果；仅当请求携带 evaluation_id 时返回，省略时不出现该字段",
     )
+
+
+class SnapshotSpecimen(BaseModel):
+    """One specimen as persisted in the ledger snapshot.
+
+    The loaded face is always the normalized effective area: a face
+    entered as ``width_mm`` x ``depth_mm`` was converted to its exact
+    Decimal product before the snapshot was written.
+    """
+
+    area_mm2: JsonNumber = Field(description="归一化后的有效受压面积，单位 mm²")
+    load_kn: JsonNumber = Field(description="破坏载荷，单位 kN")
+
+
+class EvaluationRecordResponse(BaseModel):
+    """Ledger record behind ``GET /evaluations/{evaluation_id}``.
+
+    ``result`` is the first stored verdict, exactly as originally
+    computed. The normalized input fields are present only when the
+    record carries a request snapshot; rows written before snapshots
+    existed report ``snapshot_available=false`` and omit them.
+    """
+
+    evaluation_id: str = Field(description="幂等标识")
+    created_at: str = Field(description="首次裁决的落库时间（UTC）")
+    snapshot_available: bool = Field(
+        description="请求快照是否可用；旧库记录为 false，表示当时输入不可还原"
+    )
+    design_strength_mpa: JsonNumber | None = Field(
+        default=None, description="规范化的设计强度，单位 MPa；仅快照可用时返回"
+    )
+    specimens: list[SnapshotSpecimen] | None = Field(
+        default=None,
+        description="三块试件的有效受压面积与破坏载荷（按提交顺序）；仅快照可用时返回",
+    )
+    calibration_factor: JsonNumber | None = Field(
+        default=None,
+        description="裁决使用的校准系数（未显式提交时为 1）；仅快照可用时返回",
+    )
+    calibration_explicit: bool | None = Field(
+        default=None,
+        description="调用方是否显式提交了校准系数；仅快照可用时返回",
+    )
+    result: EvaluationResponse = Field(description="首次裁决结果（不含 replayed 标记）")
